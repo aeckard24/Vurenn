@@ -89,7 +89,7 @@ except ImportError:
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-WAKE_WORD        = "delta"
+WAKE_WORD        = "semyro"
 INACTIVITY_SECS  = 60          # Switch to clock after this many idle seconds
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")  # Set env var or paste key here
 
