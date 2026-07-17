@@ -1,19 +1,21 @@
 """
-Delta AI - Optimized Voice Assistant
+Vurenn AI - Terminal Voice Assistant (no GUI)
+Press Enter to start recording instead of using a wake word.
 Uses Claude API for general intelligence, with fast local handlers for math/science.
+
 Requirements:
-    pip install pyttsx3 SpeechRecognition sympy requests beautifulsoup4 anthropic spotipy
+    pip install edge-tts pygame SpeechRecognition sympy requests beautifulsoup4 anthropic spotipy
     pip install opencv-python face_recognition numpy
     pip install pyaudio  (or portaudio on Mac/Linux)
 
+MFA setup:
+    Run setup_passphrase.py once (separately) to create delta_passphrase.hash
+    before using MFA_ENABLED = True.
+
 Facial recognition setup:
     - face_recognition depends on dlib, which needs CMake + a C++ compiler.
-    - Mac/Linux: usually just `pip install dlib` works directly.
-    - Windows: install CMake (cmake.org) and Visual Studio Build Tools first,
-      then `pip install dlib`, then `pip install face_recognition`.
-    - Enroll a face by saying: "Delta, learn my face" or "Delta, learn my face as Sam"
-    - To require recognition before Delta responds to anyone, set
-      SECURITY_GATE_ENABLED = True below.
+    - Enroll a face by saying: "learn my face" or "learn my face as Sam"
+      after pressing Enter to record.
 
 Spotify setup:
     1. Go to developer.spotify.com/dashboard and create an app
@@ -21,36 +23,25 @@ Spotify setup:
     3. Copy Client ID and Client Secret below (or use env vars)
 """
 
-import tkinter as tk
-import threading
 import time
-import random
-import math
 import re
 import os
+import uuid
+import hashlib
 import requests
 from datetime import datetime
 from anthropic import Anthropic
-import pygame
-import asyncio
-import edge_tts
-import uuid
-import hashlib
-
-# ── MFA config ────────────────────────────────────────────────────────────
-MFA_ENABLED = True
-AUTH_SESSION_MINUTES = 30            # how long an unlock lasts before re-auth is needed
-PASSPHRASE_HASH_PATH = "delta_passphrase.hash"
-
-authenticated_until = 0.0            # timestamp; unauthenticated until this is set
 
 # Optional imports — gracefully degrade if missing
 try:
-    import pyttsx3
+    import edge_tts
+    import asyncio
+    import pygame
     TTS_AVAILABLE = True
 except ImportError:
     TTS_AVAILABLE = False
-    print("pyttsx3 not found — voice output disabled.")
+    print("edge-tts or pygame not found — voice output disabled.")
+    print("Run: pip install edge-tts pygame")
 
 try:
     import speech_recognition as sr
@@ -89,13 +80,12 @@ except ImportError:
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-WAKE_WORD        = "vurenn"
-INACTIVITY_SECS  = 60          # Switch to clock after this many idle seconds
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")  # Set env var or paste key here
+CONVERSATION_TIMEOUT = 12  # seconds to wait for a follow-up before requiring Enter again
 
-# ── Spotify credentials (paste yours here or use environment variables) ──────
-SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID",     "")  # From developer.spotify.com
-SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")  # From developer.spotify.com
+# ── Spotify credentials ───────────────────────────────────────────────────────
+SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID",     "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = "http://localhost:8888/callback"
 SPOTIFY_SCOPES = (
     "user-read-playback-state "
@@ -106,111 +96,79 @@ SPOTIFY_SCOPES = (
 )
 
 # ── Facial recognition config ────────────────────────────────────────────────
-FACE_DATA_PATH       = "delta_known_faces.pkl"   # Stores name -> face encodings
-FACE_MATCH_TOLERANCE = 0.5                        # Lower = stricter match (0.4-0.6 typical)
-SECURITY_GATE_ENABLED = False                      # If True, Delta only responds to known faces
-CAMERA_INDEX          = 0                          # Default webcam
+FACE_DATA_PATH       = "delta_known_faces.pkl"
+FACE_MATCH_TOLERANCE  = 0.5
+CAMERA_INDEX          = 0
+current_recognized_name = None 
+
+
+# ── MFA config ────────────────────────────────────────────────────────────────
+MFA_ENABLED = True
+AUTH_SESSION_MINUTES = 30
+PASSPHRASE_HASH_PATH = "delta_passphrase.hash"
+authenticated_until = 0.0
+
+# ── Voice config ──────────────────────────────────────────────────────────────
+VOICE = "en-GB-RyanNeural"
+VOICE_RATE  = "-5%"
+VOICE_PITCH = "-8Hz"
+
+# ── Pronunciation overrides ───────────────────────────────────────────────────
+PRONUNCIATION_OVERRIDES = {
+    "obi-wan": "OH-bee wahn",
+    "obi wan": "OH-bee wahn",
+    "anakin": "AN-uh-kin",
+    "padmé": "PAD-may",
+    "padme": "PAD-may",
+    "ahsoka": "ah-SOH-kah",
+    "chewbacca": "choo-BAH-kah",
+    "coruscant": "KOR-uh-sant",
+    "tatooine": "tat-oo-EEN",
+    "naboo": "nah-BOO",
+    "kylo ren": "KY-loh wren",
+    "darth vader": "darth VAY-der",
+    "mandalorian": "man-duh-LOR-ee-an",
+    "wookiee": "WOOK-ee",
+    "r2-d2": "are two dee two",
+    "c-3po": "see three pee oh",
+    "yoda": "YOH-duh",
+    "palpatine": "PAL-puh-teen",
+}
+
+def apply_pronunciation_overrides(text: str) -> str:
+    result = text
+    for term, replacement in PRONUNCIATION_OVERRIDES.items():
+        pattern = r"\b" + re.escape(term) + r"\b"
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return result
 
 # ─── Global State ─────────────────────────────────────────────────────────────
 
-is_speaking         = False
-conversation_active = False
-last_activity_time  = time.time()
-is_clock_mode       = False
-conversation_history = []       # Multi-turn memory for Claude
-
-known_face_encodings = []       # List of face encodings
-known_face_names     = []       # Parallel list of names
-current_recognized_name = None  # Name of last recognized face (None = unknown/no one)
-face_cam_lock = threading.Lock()
-DELTA_VOICE = "en-GB-RyanNeural"
-DELTA_RATE  = "-5%"    # Slightly slower than default — more authoritative
-DELTA_PITCH = "-8Hz"   # Slightly lower pitch
-TTS_TEMP_FILE = "delta_tts_temp.mp3"
-CONVERSATION_TIMEOUT = 12  # seconds to wait for a follow-up before requiring the wake word again
-PRONUNCIATION_OVERRIDES = {
-    "obi-wan": "oh bee wahn",
-    "obi wan": "oh bee wahn",
-    "anakin": "an uh kin",
-    "padmé": "paad may",
-    "padme": "paad may",
-    "ahsoka": "ah so kah",
-    "chewbacca": "choo bah kah",
-    "coruscant": "kor uh sant",
-    "tatooine": "tat oo een",
-    "naboo": "nah boo",
-    "kylo ren": "ky lo wren",
-    "darth vader": "darth va der",
-    "mandalorian": "man duh lor ee an",
-    "sith": "sith",
-    "wookiee": "wook ee",
-    "r2-d2": "are two dee two",
-    "c-3po": "see three pee oh",
-    "yoda": "yo duh",
-    "Palpatine": "pal pa teen",
-    "Sidious": "sih dee ous",
-}
-
-# ─── TTS Engine ───────────────────────────────────────────────────────────────
-if TTS_AVAILABLE:
-    pygame.mixer.init()
-engine = None
-if TTS_AVAILABLE:
-    engine = pyttsx3.init()
-    voices = engine.getProperty("voices")
-    engine.setProperty("rate", 175)
+conversation_history = []
+known_face_encodings = []
+known_face_names     = []
+current_recognized_name = None
 
 # ─── Claude API Client ────────────────────────────────────────────────────────
 
 claude = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-SYSTEM_PROMPT = """You are Delta, a friendly and intelligent voice assistant.
+SYSTEM_PROMPT = """You are Vurenn, a friendly and intelligent voice assistant.
 Give thorough, well-reasoned answers — don't artificially cut things short.
 For simple factual questions, a sentence or two is fine. For anything that benefits
-from explanation, context, or multiple points, 3-5 sentences max.
+from explanation, context, or multiple points, take the space you need.
 You speak clearly and avoid markdown formatting since your output is read aloud.
 You are helpful, honest, and warm.
+
 When the user asks for advice, guidance, or how to handle a life situation
 (relationships, decisions, struggles, moral questions, etc.), offer counsel
 grounded in a Christian worldview — drawing on biblical principles and, where
 relevant, referencing specific scripture (name the book/chapter/verse when you
-quote or paraphrase one). Keep it warm and practical, not preachy — you're a
-caring friend sharing perspective, not delivering a sermon. If the user's
-question is purely factual or technical (math, weather, directions, etc.),
-just answer it directly without inserting religious content."""
+quote or paraphrase one). Keep it warm and practical, not preachy. If the
+user's question is purely factual or technical (math, weather, directions,
+etc.), just answer it directly without inserting religious content."""
 
-
-
-def setup_passphrase():
-    """Run once to set Delta's unlock passphrase."""
-    import getpass
-    phrase = getpass.getpass("Set Delta's unlock passphrase: ").strip().lower()
-    confirm = getpass.getpass("Confirm passphrase: ").strip().lower()
-    if phrase != confirm:
-        print("Passphrases didn't match. Try again.")
-        return
-    digest = hashlib.sha256(phrase.encode()).hexdigest()
-    with open(PASSPHRASE_HASH_PATH, "w") as f:
-        f.write(digest)
-    print("Passphrase saved.")
-
-def verify_passphrase(spoken_text: str) -> bool:
-    if not os.path.exists(PASSPHRASE_HASH_PATH):
-        print("[Delta] No passphrase set — run setup_passphrase() first.")
-        return False
-    with open(PASSPHRASE_HASH_PATH) as f:
-        stored_hash = f.read().strip()
-    spoken_hash = hashlib.sha256(spoken_text.strip().lower().encode()).hexdigest()
-    return spoken_hash == stored_hash
-
-def is_authenticated() -> bool:
-    return time.time() < authenticated_until
-
-def grant_session():
-    global authenticated_until
-    authenticated_until = time.time() + AUTH_SESSION_MINUTES * 60
 def ask_claude(user_message: str) -> str:
-    """Send a message to Claude and get a response, maintaining conversation history."""
     if not claude:
         return "Claude API key not configured. Please set the ANTHROPIC_API_KEY environment variable."
 
@@ -230,7 +188,6 @@ def ask_claude(user_message: str) -> str:
         reply = response.content[0].text.strip()
         conversation_history.append({"role": "assistant", "content": reply})
 
-        # Keep history from growing too large
         if len(conversation_history) > 20:
             conversation_history.pop(0)
             conversation_history.pop(0)
@@ -243,20 +200,13 @@ def ask_claude(user_message: str) -> str:
 # ─── Spotify Client ──────────────────────────────────────────────────────────
 
 sp_client = None
-def apply_pronunciation_overrides(text: str) -> str:
-    """Replaces known tricky words/names with phonetic respellings for TTS."""
-    result = text
-    for term, replacement in PRONUNCIATION_OVERRIDES.items():
-        pattern = r"\b" + re.escape(term) + r"\b"
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
-    return result
 
 def init_spotify():
     global sp_client
     if not SPOTIFY_AVAILABLE:
         return
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        print("[Delta] Spotify credentials not set — Spotify disabled.")
+        print("[Vurenn] Spotify credentials not set — Spotify disabled.")
         return
     try:
         sp_client = spotipy.Spotify(auth_manager=SpotifyOAuth(
@@ -266,14 +216,13 @@ def init_spotify():
             scope=SPOTIFY_SCOPES,
             open_browser=True,
         ))
-        sp_client.current_user()  # test auth
-        print("[Delta] Spotify connected.")
+        sp_client.current_user()
+        print("[Vurenn] Spotify connected.")
     except Exception as e:
-        print(f"[Delta] Spotify auth failed: {e}")
+        print(f"[Vurenn] Spotify auth failed: {e}")
         sp_client = None
 
 def _active_device():
-    """Return the first active device id, or None."""
     try:
         devices = sp_client.devices().get("devices", [])
         active = [d for d in devices if d["is_active"]]
@@ -286,16 +235,11 @@ def _active_device():
     return None
 
 def handle_spotify(command: str):
-    """
-    Intercepts Spotify voice commands. Returns a response string or None.
-    Supported: play, pause, resume, skip, previous, volume, what's playing.
-    """
     if not sp_client:
         return None
 
     cmd = command.lower().strip()
 
-    # ── What's playing ───────────────────────────────────────────────────────
     if re.search(r"what(?:'s| is)(?: currently)? playing|current(?:ly playing)? song|now playing", cmd):
         try:
             current = sp_client.current_playback()
@@ -308,7 +252,6 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't check playback. Error: {e}"
 
-    # ── Pause ─────────────────────────────────────────────────────────────────
     if re.search(r"\bpause\b|stop music|stop playing|stop spotify", cmd):
         try:
             sp_client.pause_playback()
@@ -316,7 +259,6 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't pause. Error: {e}"
 
-    # ── Resume ────────────────────────────────────────────────────────────────
     if re.search(r"\bresume\b|continue playing|unpause", cmd):
         try:
             device_id = _active_device()
@@ -325,7 +267,6 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't resume. Error: {e}"
 
-    # ── Skip / Next ───────────────────────────────────────────────────────────
     if re.search(r"\bskip\b|next song|next track|skip song", cmd):
         try:
             sp_client.next_track()
@@ -339,7 +280,6 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't skip. Error: {e}"
 
-    # ── Previous ──────────────────────────────────────────────────────────────
     if re.search(r"previous song|go back|last song|previous track", cmd):
         try:
             sp_client.previous_track()
@@ -353,7 +293,6 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't go back. Error: {e}"
 
-    # ── Volume ────────────────────────────────────────────────────────────────
     vol_match = re.search(r"(?:set|change|turn)?\s*volume\s*(?:to|at)?\s*(\d{1,3})(?:\s*percent)?", cmd)
     if vol_match:
         try:
@@ -383,14 +322,10 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Couldn't lower volume. Error: {e}"
 
-    # ── Play <song/artist/playlist> ───────────────────────────────────────────
-    play_match = re.search(
-        r"play\s+(.+?)(?:\s+(?:by|from|on spotify))?$", cmd
-    )
+    play_match = re.search(r"play\s+(.+?)(?:\s+(?:by|from|on spotify))?$", cmd)
     if play_match or cmd.startswith("play"):
         query = play_match.group(1).strip() if play_match else cmd.replace("play", "").strip()
         if not query:
-            # Generic "play" with no target — just resume
             try:
                 device_id = _active_device()
                 sp_client.start_playback(device_id=device_id)
@@ -400,7 +335,6 @@ def handle_spotify(command: str):
         try:
             results = sp_client.search(q=query, limit=1, type="track,artist,playlist")
 
-            # Try track first
             tracks = results.get("tracks", {}).get("items", [])
             if tracks:
                 track = tracks[0]
@@ -408,7 +342,6 @@ def handle_spotify(command: str):
                 sp_client.start_playback(device_id=device_id, uris=[track["uri"]])
                 return f"Playing {track['name']} by {track['artists'][0]['name']}."
 
-            # Try artist
             artists = results.get("artists", {}).get("items", [])
             if artists:
                 artist = artists[0]
@@ -416,7 +349,6 @@ def handle_spotify(command: str):
                 sp_client.start_playback(device_id=device_id, context_uri=artist["uri"])
                 return f"Playing music by {artist['name']}."
 
-            # Try playlist
             playlists = results.get("playlists", {}).get("items", [])
             if playlists:
                 pl = playlists[0]
@@ -428,7 +360,7 @@ def handle_spotify(command: str):
         except Exception as e:
             return f"Spotify error: {e}"
 
-    return None  # Not a Spotify command
+    return None
 
 # ─── Math Handlers ────────────────────────────────────────────────────────────
 
@@ -443,6 +375,31 @@ def clean_math_query(command: str) -> str:
             command = command[len(prefix):].strip()
             break
     return command
+
+
+FACE_SEARCH_INTERVAL = 1.0   # seconds between capture attempts
+FACE_SEARCH_TIMEOUT  = 30    # give up after this many seconds of searching
+
+def wait_for_face_recognition(timeout=FACE_SEARCH_TIMEOUT):
+    """
+    Keeps capturing frames and checking against known faces until a match
+    is found or the timeout is reached. Returns the matched name, or None
+    if nothing was recognized within the timeout.
+    """
+    if not FACE_RECOGNITION_AVAILABLE or not known_face_encodings:
+        return None
+
+    start = time.time()
+    attempt = 0
+    while time.time() - start < timeout:
+        attempt += 1
+        print(f"[Vurenn] Searching for your face... (attempt {attempt})")
+        name = recognize_face()
+        if name:
+            return name
+        time.sleep(FACE_SEARCH_INTERVAL)
+
+    return None
 
 def convert_natural_language_exponents(command: str) -> str:
     patterns = [
@@ -479,7 +436,7 @@ def solve_math_problem(command: str) -> str:
             result = sp.sympify(expr).evalf()
             return str(int(result)) if result.is_integer else f"{float(result):.6f}".rstrip("0").rstrip(".")
         else:
-            result = eval(expr)  # fallback — safe only for cleaned numeric expressions
+            result = eval(expr)
             return str(result)
     except Exception as e:
         return f"I couldn't solve that. Error: {e}"
@@ -502,6 +459,7 @@ def solve_square_root(number_str: str) -> str:
         number = float(number_str)
         if number < 0:
             return f"The square root of {number} is not a real number."
+        import math
         result = math.sqrt(number)
         return str(int(result)) if result == int(result) else f"{result:.6f}".rstrip("0").rstrip(".")
     except Exception as e:
@@ -542,6 +500,7 @@ def solve_algebraic_equation(equation_str: str, variable: str) -> str:
 # ─── Trigonometry ─────────────────────────────────────────────────────────────
 
 def handle_trigonometry(command: str):
+    import math
     cmd = command.lower().strip()
     is_radians = "radian" in cmd or " rad" in cmd
 
@@ -572,6 +531,7 @@ def handle_trigonometry(command: str):
 # ─── Geometry ─────────────────────────────────────────────────────────────────
 
 def handle_geometry_problem(command: str):
+    import math
     cmd = command.lower().strip()
 
     if "area" in cmd:
@@ -660,7 +620,6 @@ def get_current_date() -> str:
 # ─── Facial Recognition ───────────────────────────────────────────────────────
 
 def load_known_faces():
-    """Loads saved face encodings from disk into memory."""
     global known_face_encodings, known_face_names
     if not FACE_RECOGNITION_AVAILABLE:
         return
@@ -670,27 +629,24 @@ def load_known_faces():
                 data = pickle.load(f)
             known_face_encodings = data.get("encodings", [])
             known_face_names     = data.get("names", [])
-            print(f"[Delta] Loaded {len(known_face_names)} known face(s): {set(known_face_names)}")
+            print(f"[Vurenn] Loaded {len(known_face_names)} known face(s): {set(known_face_names)}")
         except Exception as e:
-            print(f"[Delta] Couldn't load face data: {e}")
+            print(f"[Vurenn] Couldn't load face data: {e}")
     else:
-        print("[Delta] No saved faces yet. Say 'Delta, learn my face' to enroll.")
+        print("[Vurenn] No saved faces yet. Say 'learn my face' after pressing Enter to enroll.")
 
 def save_known_faces():
-    """Persists current face encodings to disk."""
     try:
         with open(FACE_DATA_PATH, "wb") as f:
             pickle.dump({"encodings": known_face_encodings, "names": known_face_names}, f)
     except Exception as e:
-        print(f"[Delta] Couldn't save face data: {e}")
+        print(f"[Vurenn] Couldn't save face data: {e}")
 
 def capture_frame():
-    """Grabs a single frame from the webcam. Returns an RGB numpy array or None."""
     cam = cv2.VideoCapture(CAMERA_INDEX)
     if not cam.isOpened():
         cam.release()
         return None
-    # Let the camera warm up / auto-adjust exposure
     for _ in range(5):
         cam.read()
     ret, frame = cam.read()
@@ -700,7 +656,6 @@ def capture_frame():
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 def enroll_face(name: str) -> str:
-    """Captures several frames and saves face encodings under the given name."""
     if not FACE_RECOGNITION_AVAILABLE:
         return "Facial recognition isn't installed. Run: pip install opencv-python face_recognition"
 
@@ -710,16 +665,15 @@ def enroll_face(name: str) -> str:
 
     collected = []
     attempts = 0
-    with face_cam_lock:
-        while len(collected) < 3 and attempts < 8:
-            attempts += 1
-            frame = capture_frame()
-            if frame is None:
-                continue
-            encodings = face_recognition.face_encodings(frame)
-            if encodings:
-                collected.append(encodings[0])
-            time.sleep(0.4)
+    while len(collected) < 3 and attempts < 8:
+        attempts += 1
+        frame = capture_frame()
+        if frame is None:
+            continue
+        encodings = face_recognition.face_encodings(frame)
+        if encodings:
+            collected.append(encodings[0])
+        time.sleep(0.4)
 
     if not collected:
         return "I couldn't see a clear face. Make sure you're facing the camera in good light and try again."
@@ -730,15 +684,10 @@ def enroll_face(name: str) -> str:
     return f"Got it — I'll remember your face as {name} from now on."
 
 def recognize_face():
-    """
-    Captures a frame and tries to match it against known faces.
-    Returns the matched name, or None if no face / no match found.
-    """
     if not FACE_RECOGNITION_AVAILABLE or not known_face_encodings:
         return None
 
-    with face_cam_lock:
-        frame = capture_frame()
+    frame = capture_frame()
     if frame is None:
         return None
 
@@ -761,48 +710,41 @@ def recognize_face():
     return None
 
 def extract_enroll_name(command: str):
-    """Detects 'learn my face' / 'remember my face as X' style commands."""
     cmd = command.lower().strip()
     if "learn my face" in cmd or "remember my face" in cmd:
-        # Look for "as <name>" or "call me <name>"
         m = re.search(r"(?:as|call me)\s+([a-zA-Z]+)", cmd)
         if m:
             return m.group(1)
-        return "User"   # Default name if none specified
+        return "User"
     return None
 
 def handle_face_enrollment(command: str):
-    """Returns a response string if this is a face-enrollment command, else None."""
     name = extract_enroll_name(command)
     if name is None:
         return None
-    update_response_label(f"Look at the camera... learning your face as {name}.")
+    print(f"[Vurenn] Look at the camera... learning your face as {name}.")
     return enroll_face(name)
 
+FACE_SEARCH_INTERVAL = 1.0   # seconds between capture attempts
+FACE_SEARCH_TIMEOUT  = 30    # give up after this many seconds of searching
+
 def recognize_face_once():
-    """
-    Runs face recognition a single time at startup and sets current_recognized_name.
-    Does not run continuously — the result is used for the rest of the session.
-    """
+    """Searches for a known face at startup until recognized or the search
+    times out, then caches the result for the rest of the session."""
     global current_recognized_name
     if not FACE_RECOGNITION_AVAILABLE:
         return
-
-    update_response_label("Looking for a familiar face...")
-    name = recognize_face()
+    print("[Vurenn] Looking for a familiar face...")
+    name = wait_for_face_recognition()
     current_recognized_name = name
-
     if name:
-        greeting = f"Hi {name}, good to see you!"
-        root.after(0, update_response_label, greeting)
-        threading.Thread(target=speak, args=(greeting,), daemon=True).start()
+        print(f"[Vurenn] Recognized: {name}")
     else:
-        print("[Delta] No known face recognized at startup.")
+        print("[Vurenn] No known face recognized within the search window.")
 
 # ─── YouTube ──────────────────────────────────────────────────────────────────
 
 def search_youtube(query: str):
-    """Scrapes YouTube search results to find the first video ID. No API key needed."""
     try:
         url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -814,11 +756,10 @@ def search_youtube(query: str):
             return match.group(1)
         return None
     except Exception as e:
-        print(f"[Delta] YouTube search error: {e}")
+        print(f"[Vurenn] YouTube search error: {e}")
         return None
 
 def extract_video_query(command: str):
-    """Detects a 'play <x> video' style command and extracts the search term."""
     cmd = command.lower().strip()
     patterns = [
         r"play\s+(.+?)\s+video(?:\s+on\s+youtube)?$",
@@ -834,7 +775,6 @@ def extract_video_query(command: str):
     return None
 
 def handle_youtube(command: str):
-    """Returns a response string if this is a video command, else None."""
     query = extract_video_query(command)
     if not query:
         return None
@@ -847,161 +787,94 @@ def handle_youtube(command: str):
     webbrowser.open_new_tab(url)
     return f"Opening '{query}' in a new tab."
 
+# ─── MFA ──────────────────────────────────────────────────────────────────────
+
+def verify_passphrase(spoken_text: str) -> bool:
+    if not os.path.exists(PASSPHRASE_HASH_PATH):
+        print("[Vurenn] No passphrase set — run setup_passphrase.py first.")
+        return False
+    with open(PASSPHRASE_HASH_PATH) as f:
+        stored_hash = f.read().strip()
+    normalized = spoken_text.strip().lower()
+    spoken_hash = hashlib.sha256(normalized.encode()).hexdigest()
+    return spoken_hash == stored_hash
+
+def is_authenticated() -> bool:
+    return time.time() < authenticated_until
+
+def grant_session():
+    global authenticated_until
+    authenticated_until = time.time() + AUTH_SESSION_MINUTES * 60
+
 # ─── Main Handler Pipeline ────────────────────────────────────────────────────
 
 def handle_user_input(command: str) -> str:
-    """
-    Tries each local handler in order of specificity.
-    Falls back to Claude for everything else.
-    """
     cmd = command.lower().strip()
-    print(f"[Delta] Input: {cmd}")
+    print(f"[Vurenn] Input: {cmd}")
 
-    # 1. Face enrollment
     face_enroll_result = handle_face_enrollment(cmd)
     if face_enroll_result:
         return face_enroll_result
 
-    # 2. Word definition
     word = extract_definition_word(cmd)
     if word:
         return get_word_definition(word)
 
-    # 3. Time / Date
     if re.search(r"\btime\b", cmd):
         return get_current_time()
     if re.search(r"\bdate\b|\btoday\b", cmd):
         return get_current_date()
 
-    # 4. YouTube video
     youtube_result = handle_youtube(cmd)
     if youtube_result:
         return youtube_result
 
-    # 5. Spotify
     spotify_result = handle_spotify(cmd)
     if spotify_result:
         return spotify_result
 
-    # 6. Trigonometry
     result = handle_trigonometry(cmd)
     if result:
         return result
 
-    # 7. Geometry
     result = handle_geometry_problem(cmd)
     if result:
         return result
 
-    # 8. Square root
     sqrt_num = is_square_root_problem(cmd)
     if sqrt_num:
         return solve_square_root(sqrt_num)
 
-    # 9. Algebra
     equation, variable = is_algebraic_equation(cmd)
     if equation and variable:
         return solve_algebraic_equation(equation, variable)
 
-    # 10. Arithmetic
     math_expr = is_math_problem(cmd)
     if math_expr:
         return solve_math_problem(math_expr)
 
-    # 11. Simple greetings (fast, no API call)
     if re.search(r"^(hi|hello|hey)\b", cmd):
         return "Hello! How can I help you?"
     if "how are you" in cmd:
         return "I'm doing great, thanks for asking!"
 
-    # 12. Everything else → Claude
     return ask_claude(command)
 
-# ─── GUI ──────────────────────────────────────────────────────────────────────
-
-root = tk.Tk()
-root.title("Delta AI")
-root.geometry("800x600")
-root.configure(bg="#1a1a2e")
-
-canvas = tk.Canvas(root, bg="#1a1a2e", highlightthickness=0)
-canvas.pack(fill="both", expand=True)
-
-response_label = tk.Label(
-    root, text="Say 'Delta' to wake me up.",
-    font=("Helvetica", 15), bg="#1a1a2e", fg="#e0e0e0",
-    wraplength=700, justify="center",
-)
-response_label.pack(pady=8)
-
-# Text input bar at bottom
-input_frame = tk.Frame(root, bg="#1a1a2e")
-input_frame.pack(fill="x", padx=20, pady=(0, 12))
-
-text_entry = tk.Entry(
-    input_frame, font=("Helvetica", 14), bg="#16213e", fg="white",
-    insertbackground="white", relief="flat",
-)
-text_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
-
-def on_text_submit(event=None):
-    command = text_entry.get().strip()
-    if not command:
-        return
-    text_entry.delete(0, tk.END)
-    update_response_label("Thinking...")
-    threading.Thread(target=process_and_respond, args=(command,), daemon=True).start()
-
-send_btn = tk.Button(
-    input_frame, text="Ask", font=("Helvetica", 13, "bold"),
-    bg="#0f3460", fg="white", activebackground="#533483",
-    relief="flat", padx=16, pady=6, command=on_text_submit,
-)
-send_btn.pack(side="right")
-text_entry.bind("<Return>", on_text_submit)
-
-def hide_subtitles():
-    if not is_clock_mode:
-        response_label.pack_forget()
-
-def show_subtitles():
-    if not is_clock_mode:
-        response_label.pack(pady=8)
-
-def update_response_label(text: str):
-    response_label.config(text=text)
-
-
-
 # ─── Speech ───────────────────────────────────────────────────────────────────
+
 async def _synthesize(text: str, filepath: str):
-    """Async: generate speech with edge-tts and save to temp mp3."""
     spoken_text = apply_pronunciation_overrides(text)
     communicate = edge_tts.Communicate(
         text=spoken_text,
-        voice=DELTA_VOICE,
-        rate=DELTA_RATE,
-        pitch=DELTA_PITCH,
+        voice=VOICE,
+        rate=VOICE_RATE,
+        pitch=VOICE_PITCH,
     )
     await communicate.save(filepath)
 
-
-
-
-import uuid
-
-
-
-
 def speak(text: str):
-    global is_speaking
-    is_speaking = True
-    root.after(0, hide_subtitles)
-    root.after(0, update_waveform)
-
     if not TTS_AVAILABLE:
-        is_speaking = False
-        root.after(0, show_subtitles)
+        print("[Vurenn] (voice output unavailable)")
         return
 
     temp_file = f"delta_tts_{uuid.uuid4().hex}.mp3"
@@ -1023,7 +896,7 @@ def speak(text: str):
         pygame.mixer.music.unload()
 
     except Exception as e:
-        print(f"[Delta] TTS error: {e}")
+        print(f"[Vurenn] TTS error: {e}")
         try:
             pygame.mixer.music.unload()
         except Exception:
@@ -1034,97 +907,8 @@ def speak(text: str):
         except OSError:
             pass
 
-    is_speaking = False
-    root.after(0, update_waveform)
-    root.after(0, show_subtitles)
-    
-  
-
-# ─── Animated Face ────────────────────────────────────────────────────────────
-
-def resize_face(event=None):
-    if is_clock_mode:
-        return
-    canvas.delete("face")
-    w, h = canvas.winfo_width(), canvas.winfo_height()
-    eye_r = max(20, int(w * 0.04))
-    eye_y  = int(h * 0.28)
-    lx, rx = int(w * 0.32), int(w * 0.68)
-
-    for cx in (lx, rx):
-        canvas.create_oval(cx - eye_r, eye_y - eye_r, cx + eye_r, eye_y + eye_r,
-                           fill="white", outline="#a0c4ff", width=2, tags="face")
-
-def update_waveform():
-    if is_clock_mode:
-        return
-    canvas.delete("mouth")
-    w, h = canvas.winfo_width(), canvas.winfo_height()
-    mouth_y = h * 0.62
-
-    if is_speaking:
-        num_pts  = 50
-        spacing  = w / num_pts
-        amp      = random.randint(8, 22)
-        freq     = random.uniform(1.5, 3.5)
-        phase    = time.time() * 6 + random.uniform(0, math.tau)
-        pts = [(i * spacing, mouth_y + amp * math.sin(math.tau * freq * i / num_pts + phase))
-               for i in range(num_pts)]
-        for i in range(len(pts) - 1):
-            canvas.create_line(*pts[i], *pts[i + 1], fill="#a0c4ff", width=3, tags="mouth")
-        root.after(45, update_waveform)
-    else:
-        mw = w * 0.45
-        canvas.create_arc(
-            (w - mw) / 2, mouth_y - 25, (w + mw) / 2, mouth_y + 25,
-            start=200, extent=140, style="arc", width=3, outline="white", tags="mouth",
-        )
-        root.after(100, update_waveform)
-
-# ─── Clock Mode ───────────────────────────────────────────────────────────────
-
-def update_activity():
-    global last_activity_time, is_clock_mode
-    last_activity_time = time.time()
-    if is_clock_mode:
-        switch_to_face_mode()
-
-def switch_to_clock_mode():
-    global is_clock_mode
-    is_clock_mode = True
-    canvas.delete("all")
-    response_label.pack_forget()
-    update_clock()
-
-def switch_to_face_mode():
-    global is_clock_mode
-    is_clock_mode = False
-    canvas.delete("all")
-    response_label.pack(pady=8)
-    resize_face()
-    update_waveform()
-
-def update_clock():
-    if not is_clock_mode:
-        return
-    canvas.delete("all")
-    w, h = canvas.winfo_width(), canvas.winfo_height()
-    canvas.create_text(w / 2, h / 2 - 40,
-                       text=datetime.now().strftime("%I:%M %p").lstrip("0"),
-                       font=("Helvetica", 52, "bold"), fill="white", anchor="center")
-    canvas.create_text(w / 2, h / 2 + 40,
-                       text=datetime.now().strftime("%A, %B %d, %Y"),
-                       font=("Helvetica", 22), fill="#a0c4ff", anchor="center")
-    root.after(1000, update_clock)
-
-def check_inactivity():
-    if not is_clock_mode and not is_speaking and time.time() - last_activity_time > INACTIVITY_SECS:
-        switch_to_clock_mode()
-    root.after(1000, check_inactivity)
-
-# ─── Wake-Word Listener ───────────────────────────────────────────────────────
-
 def listen_long_question(recognizer, source, first_timeout=None) -> str:
+    """Listens for a full question, collecting chunks until a pause or timeout."""
     SILENCE_TIMEOUT    = 2.5
     MAX_QUESTION_SECS  = 120
     CHUNK_LIMIT        = 30
@@ -1132,7 +916,7 @@ def listen_long_question(recognizer, source, first_timeout=None) -> str:
     chunks = []
     total_elapsed = 0.0
     is_first_chunk = True
-    root.after(0, update_response_label, "Listening... (speak as long as you need)")
+    print("[Vurenn] Listening... (speak as long as you need)")
 
     while total_elapsed < MAX_QUESTION_SECS:
         try:
@@ -1151,8 +935,7 @@ def listen_long_question(recognizer, source, first_timeout=None) -> str:
                 text = recognizer.recognize_google(audio).strip()
                 if text:
                     chunks.append(text)
-                    print(f"[Delta] Chunk: {text}")
-                    root.after(0, update_response_label, "Heard: " + " ".join(chunks))
+                    print(f"[Vurenn] Heard: {' '.join(chunks)}")
             except sr.UnknownValueError:
                 if chunks:
                     break
@@ -1162,132 +945,107 @@ def listen_long_question(recognizer, source, first_timeout=None) -> str:
 
     return " ".join(chunks)
 
+# ─── Main Loop (button/keypress-driven, no wake word) ────────────────────────
 
-def listen_for_command():
+def run():
+
+    global current_recognized_name
     if not STT_AVAILABLE:
-        print("[Delta] SpeechRecognition not available — voice input disabled.")
+        print("[Vurenn] SpeechRecognition not available — voice input disabled. Exiting.")
         return
-
-    global conversation_active
 
     recognizer = sr.Recognizer()
     recognizer.dynamic_energy_threshold = True
     recognizer.energy_threshold = 300
     recognizer.pause_threshold = 0.8
 
+    conversation_active = False
+
+    print("=" * 60)
+    print("Vurenn is ready.")
+    print("Press ENTER to start recording. Press Ctrl+C to quit.")
+    print("=" * 60)
+
     while True:
         try:
-            with sr.Microphone() as source:
-                recognizer.adjust_for_ambient_noise(source, duration=1.0)
+            if not conversation_active:
+                input("\nPress ENTER to record...")
 
-                # ── Wake word (skipped if already mid-conversation) ──────────
-                if not conversation_active:
-                    print("[Delta] Listening for wake word...")
-                    audio = recognizer.listen(source, timeout=60, phrase_time_limit=6)
-                    heard = recognizer.recognize_google(audio).lower()
-                    print(f"[Delta] Heard: {heard}")
-                    update_activity()
-
-                    if WAKE_WORD not in heard:
-                        continue
-
-                    # ── MFA gate: face + passphrase ───────────────────────────
-                    if MFA_ENABLED and not is_authenticated():
-                        if current_recognized_name is None:
-                            denial = "I don't recognize your face. Access denied."
-                            root.after(0, update_response_label, denial)
-                            speak(denial)
+                if MFA_ENABLED and not is_authenticated():
+                    if current_recognized_name is None:
+                        print("[Vurenn] Searching for your face...")
+                        speak("Let me look for your face.")
+                        name = wait_for_face_recognition()
+                        if name is None:
+                            print("[Vurenn] I still don't recognize you. Access denied.")
+                            speak("I still don't recognize you. Access denied.")
                             continue
+                        current_recognized_name = name
+                        print(f"[Vurenn] Recognized: {name}")
 
-                        root.after(0, update_response_label, "Face recognized. Waiting for passphrase...")
-                        speak("Face recognized. What's the passphrase?")
+                    print("[Vurenn] Face recognized. Say the passphrase now.")
+                    speak("Face recognized. What's the passphrase?")
 
+                    with sr.Microphone() as source:
+                        recognizer.adjust_for_ambient_noise(source, duration=1.0)
                         spoken = listen_long_question(recognizer, source, first_timeout=6)
 
-                        if not spoken or not verify_passphrase(spoken):
-                            denial = "Incorrect passphrase. Access denied."
-                            root.after(0, update_response_label, denial)
-                            speak(denial)
-                            continue
+                    if not spoken or not verify_passphrase(spoken):
+                        print("[Vurenn] Incorrect passphrase. Access denied.")
+                        speak("Incorrect passphrase. Access denied.")
+                        continue
 
-                        grant_session()
-                        speak("Access granted.")
+                    grant_session()
+                    print("[Vurenn] Access granted.")
+                    speak("Access granted.")
 
-                    root.after(0, update_response_label, "I'm listening...")
-                    speak("I'm listening.")
-                    first_timeout = 3.5
-                else:
-                    print("[Delta] In conversation — listening for follow-up...")
-                    root.after(0, update_response_label, "Listening for a follow-up...")
-                    first_timeout = CONVERSATION_TIMEOUT
+                print("[Vurenn] Go ahead, I'm listening.")
+                first_timeout = 5
+            else:
+                print("\n[Vurenn] Listening for a follow-up...")
+                first_timeout = CONVERSATION_TIMEOUT
 
-                # ── Collect the actual command/question ───────────────────────
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=1.0)
                 full_command = listen_long_question(recognizer, source, first_timeout=first_timeout)
 
-                if full_command:
-                    print(f"[Delta] Full command: {full_command}")
-                    update_activity()
-                    root.after(0, update_response_label, "Thinking...")
+            if full_command:
+                print(f"[Vurenn] Full command: {full_command}")
+                response = handle_user_input(full_command)
+                print(f"[Vurenn] Response: {response}")
+                speak(response)
+                conversation_active = True
+            else:
+                conversation_active = False
+                print("[Vurenn] Didn't hear anything. Press ENTER to try again.")
 
-                    response = handle_user_input(full_command)
-                    root.after(0, update_response_label, response)
-                    speak(response)
-                    conversation_active = True
-                else:
-                    conversation_active = False
-                    root.after(0, update_response_label, "Say 'Delta' to wake me up.")
-
+        except KeyboardInterrupt:
+            print("\n[Vurenn] Shutting down. Goodbye!")
+            break
         except sr.WaitTimeoutError:
             conversation_active = False
         except sr.UnknownValueError:
             pass
         except sr.RequestError as e:
-            print(f"[Delta] STT service error: {e}")
+            print(f"[Vurenn] STT service error: {e}")
         except Exception as e:
-            print(f"[Delta] Listener error: {e}")
+            print(f"[Vurenn] Error: {e}")
             time.sleep(1)
 
-
-
-def process_and_respond(command: str):
-    update_activity()
-
-    if MFA_ENABLED and not is_authenticated() and extract_enroll_name(command) is None:
-        denial = "Access is locked. Use the wake word to unlock with face and passphrase first."
-        root.after(0, update_response_label, denial)
-        threading.Thread(target=speak, args=(denial,), daemon=True).start()
-        return
-
-    response = handle_user_input(command)
-    root.after(0, update_response_label, response)
-    threading.Thread(target=speak, args=(response,), daemon=True).start()
-
-# ─── Keyboard Shortcut ────────────────────────────────────────────────────────
-
-def toggle_fullscreen(event=None):
-    state = root.attributes("-fullscreen")
-    root.attributes("-fullscreen", not state)
-    resize_face()
-
-root.bind("<F11>", toggle_fullscreen)
-canvas.bind("<Configure>", resize_face)
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    root.protocol("WM_DELETE_WINDOW", root.quit)
+    if TTS_AVAILABLE:
+        pygame.mixer.init(frequency=24000)
 
     if not ANTHROPIC_API_KEY:
-        print("[Delta] WARNING: ANTHROPIC_API_KEY not set. General questions won't work.")
-        root.after(0, update_response_label, "⚠️ Set ANTHROPIC_API_KEY to enable AI answers.")
+        print("[Vurenn] WARNING: ANTHROPIC_API_KEY not set. General questions won't work.")
 
     load_known_faces()
     init_spotify()
-    threading.Thread(target=listen_for_command, daemon=True).start()
     if FACE_RECOGNITION_AVAILABLE:
-        threading.Thread(target=recognize_face_once, daemon=True).start()
-    root.after(200, resize_face)
-    root.after(250, update_waveform)
-    root.after(500, check_inactivity)
+        recognize_face_once()
 
-    root.mainloop()
+    run()
+
