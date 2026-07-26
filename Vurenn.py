@@ -79,7 +79,7 @@ except ImportError:
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID",     "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
