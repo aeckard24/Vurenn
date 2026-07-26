@@ -30,6 +30,13 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 from anthropic import Anthropic
 
 try:
+    import stripe
+    STRIPE_AVAILABLE = True
+except ImportError:
+    STRIPE_AVAILABLE = False
+    print("stripe not found — subscriptions disabled. Run: pip install stripe")
+
+try:
     import edge_tts
     TTS_AVAILABLE = True
 except ImportError:
@@ -92,6 +99,50 @@ MFA_ENABLED = True
 AUTH_SESSION_MINUTES = 30
 PASSPHRASE_HASH_PATH = "delta_passphrase.hash"
 authenticated_until = 0.0
+
+# ── Stripe subscription config ────────────────────────────────────────────
+STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "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")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "pk_live_51Tv6UmCAs6UWVTMh3ROD6TpuN8Oz3imEUUpt7A1QU9Kl31Ls50ioTBhEX7UaxxqZOB4ucogikZoyZgHp4DW8XNv000ysvlxeCV")  # pk_...  safe for frontend
+STRIPE_PRICE_ID        = os.environ.get("STRIPE_PRICE_ID", "price_1TvJTvCAs6UWVTMhS4S0s5H7")         # price_...  (NOT prod_...)
+STRIPE_WEBHOOK_SECRET  = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_55e5405179016c4fc35cb11a45c36c95b54930be37630e7e69d090e298d49e03")   # whsec_...
+YOUR_DOMAIN             = os.environ.get("YOUR_DOMAIN", "http://localhost:5000")
+SUBSCRIPTION_STATUS_PATH = "subscription_status.json"
+REQUIRE_SUBSCRIPTION = True   # gate voice commands behind an active subscription
+
+def load_subscription_status():
+    import json
+    defaults = {"active": False, "customer_id": None, "subscription_id": None}
+    if os.path.exists(SUBSCRIPTION_STATUS_PATH):
+        try:
+            with open(SUBSCRIPTION_STATUS_PATH) as f:
+                defaults.update(json.load(f))
+        except Exception as e:
+            print(f"[Vurenn] Couldn't load subscription status: {e}")
+    return defaults
+
+def save_subscription_status(data):
+    import json
+    with open(SUBSCRIPTION_STATUS_PATH, "w") as f:
+        json.dump(data, f)
+
+subscription_status = load_subscription_status()
+
+def is_subscribed() -> bool:
+    return subscription_status.get("active", False)
+
+def get_or_create_customer():
+    """Single-user app: reuse the same Stripe Customer across sessions."""
+    stripe.api_key = STRIPE_SECRET_KEY
+    customer_id = subscription_status.get("customer_id")
+    if customer_id:
+        try:
+            return stripe.Customer.retrieve(customer_id)
+        except Exception:
+            pass  # fall through and create a new one if retrieval fails
+    customer = stripe.Customer.create()
+    subscription_status["customer_id"] = customer.id
+    save_subscription_status(subscription_status)
+    return customer
 
 VOICE_CONFIG_PATH = "voice_config.json"
 
@@ -813,6 +864,7 @@ INDEX_HTML = """
   <audio id="player" style="display:none;"></audio>
   <a href="/setup" style="margin-top:30px; color:#a0c4ff; font-size:13px;">Set / change passphrase</a>
   <a href="/voice" style="margin-top:10px; color:#a0c4ff; font-size:13px;">Change voice</a>
+  <a href="/subscribe" style="margin-top:10px; color:#a0c4ff; font-size:13px;">Manage subscription</a>
 
 <script>
 let mediaRecorder;
@@ -858,6 +910,10 @@ async function sendRecording() {
 
     if (data.stage === "error") {
       statusEl.textContent = data.message;
+      return;
+    }
+    if (data.stage === "subscription_required") {
+      statusEl.innerHTML = data.message + ' <a href="' + data.subscribe_url + '" style="color:#a0c4ff;">Subscribe</a>';
       return;
     }
     if (data.stage === "denied") {
@@ -974,6 +1030,211 @@ document.getElementById("save-btn").addEventListener("click", async () => {
 @app.route("/setup")
 def setup_page():
     return Response(SETUP_HTML, mimetype="text/html")
+
+SUBSCRIBE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Vurenn - Subscribe</title>
+<script src="https://js.stripe.com/v3/"></script>
+<style>
+  body { background:#1a1a2e; color:#e0e0e0; font-family:Helvetica,Arial,sans-serif;
+         display:flex; flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; margin:0; text-align:center; padding:20px; box-sizing:border-box; }
+  h2 { color:#a0c4ff; }
+  p { color:#888; max-width:360px; }
+  #payment-form { width:360px; max-width:90vw; }
+  #payment-element { margin:16px 0; padding:16px; background:#16213e; border-radius:8px; }
+  button { margin-top:12px; padding:12px 28px; border:none; border-radius:6px;
+           background:#0f3460; color:white; font-weight:bold; cursor:pointer; font-size:16px; width:100%; }
+  button:hover { background:#533483; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  #msg { margin-top:16px; font-size:14px; min-height:20px; color:#e94560; }
+  a { margin-top:24px; color:#a0c4ff; font-size:13px; }
+</style>
+</head>
+<body>
+  <h2>Subscribe to Vurenn</h2>
+  <p id="status-text">__STATUS_TEXT__</p>
+
+  <form id="payment-form" style="__FORM_DISPLAY__">
+    <div id="payment-element"></div>
+    <button id="submit-btn">Subscribe</button>
+  </form>
+  <div id="msg"></div>
+  <a href="/">&larr; Back</a>
+
+<script>
+const alreadySubscribed = __ALREADY_SUBSCRIBED__;
+
+if (!alreadySubscribed) {
+  (async () => {
+    const msg = document.getElementById("msg");
+    const submitBtn = document.getElementById("submit-btn");
+
+    let stripe, elements;
+
+    try {
+      const res = await fetch("/api/create-subscription", { method: "POST" });
+      const data = await res.json();
+      if (data.error) {
+        msg.textContent = data.error;
+        submitBtn.disabled = true;
+        return;
+      }
+
+      stripe = Stripe(data.publishableKey);
+      elements = stripe.elements({ clientSecret: data.clientSecret });
+      const paymentElement = elements.create("payment");
+      paymentElement.mount("#payment-element");
+    } catch (err) {
+      msg.textContent = "Error loading payment form: " + err;
+      return;
+    }
+
+    document.getElementById("payment-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      submitBtn.disabled = true;
+      msg.style.color = "#a0c4ff";
+      msg.textContent = "Processing...";
+
+      const { error, paymentIntent } = await stripe.confirmPayment({
+        elements,
+        confirmParams: { return_url: window.location.origin + "/success" },
+        redirect: "if_required",
+      });
+
+      if (error) {
+        msg.style.color = "#e94560";
+        msg.textContent = error.message;
+        submitBtn.disabled = false;
+      } else {
+        msg.style.color = "#4caf50";
+        msg.textContent = "Payment successful! Activating your subscription...";
+        setTimeout(() => window.location.href = "/success", 1200);
+      }
+    });
+  })();
+}
+</script>
+</body>
+</html>
+"""
+
+@app.route("/subscribe")
+def subscribe_page():
+    if is_subscribed():
+        status_text = "You're already subscribed."
+        already = "true"
+        form_display = "display:none;"
+    else:
+        status_text = "Unlock Vurenn with a recurring subscription."
+        already = "false"
+        form_display = ""
+    html = (SUBSCRIBE_HTML
+            .replace("__STATUS_TEXT__", status_text)
+            .replace("__ALREADY_SUBSCRIBED__", already)
+            .replace("__FORM_DISPLAY__", form_display))
+    return Response(html, mimetype="text/html")
+
+@app.route("/api/create-subscription", methods=["POST"])
+def api_create_subscription():
+    if not STRIPE_AVAILABLE:
+        return jsonify({"error": "Stripe isn't installed on the server."}), 500
+    if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID or not STRIPE_PUBLISHABLE_KEY:
+        return jsonify({"error": "Stripe isn't fully configured yet."}), 500
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    try:
+        customer = get_or_create_customer()
+
+        subscription = stripe.Subscription.create(
+            customer=customer.id,
+            items=[{"price": STRIPE_PRICE_ID}],
+            payment_behavior="default_incomplete",
+            payment_settings={"save_default_payment_method": "on_subscription"},
+            expand=["latest_invoice.confirmation_secret"],
+        )
+
+        subscription_status["subscription_id"] = subscription.id
+        save_subscription_status(subscription_status)
+
+        client_secret = subscription.latest_invoice.confirmation_secret.client_secret
+
+        return jsonify({
+            "clientSecret": client_secret,
+            "publishableKey": STRIPE_PUBLISHABLE_KEY,
+        })
+    except Exception as e:
+        return jsonify({"error": f"Stripe error: {e}"}), 500
+
+@app.route("/success")
+def success_page():
+    return Response(
+        "<body style='background:#1a1a2e;color:#e0e0e0;font-family:sans-serif;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;'>"
+        "<div style='text-align:center;'><h2 style='color:#4caf50;'>Subscription successful!</h2>"
+        "<p>You can close this tab and return to Vurenn.</p>"
+        "<a href='/' style='color:#a0c4ff;'>Back to Vurenn</a></div></body>",
+        mimetype="text/html",
+    )
+
+@app.route("/cancel")
+def cancel_page():
+    return Response(
+        "<body style='background:#1a1a2e;color:#e0e0e0;font-family:sans-serif;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;'>"
+        "<div style='text-align:center;'><h2 style='color:#e94560;'>Checkout cancelled</h2>"
+        "<a href='/subscribe' style='color:#a0c4ff;'>Try again</a></div></body>",
+        mimetype="text/html",
+    )
+
+@app.route("/webhook", methods=["POST"])
+def stripe_webhook():
+    if not STRIPE_AVAILABLE:
+        return "", 500
+
+    stripe.api_key = STRIPE_SECRET_KEY
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        if STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        else:
+            import json
+            event = json.loads(payload)
+    except Exception as e:
+        print(f"[Vurenn] Webhook signature verification failed: {e}")
+        return "", 400
+
+    event_type = event["type"] if isinstance(event, dict) else event.type
+    data_object = event["data"]["object"] if isinstance(event, dict) else event.data.object
+
+    if event_type == "invoice.payment_succeeded":
+        subscription_status["active"] = True
+        customer_id = data_object.get("customer")
+        subscription_id = data_object.get("subscription")
+        if customer_id:
+            subscription_status["customer_id"] = customer_id
+        if subscription_id:
+            subscription_status["subscription_id"] = subscription_id
+        save_subscription_status(subscription_status)
+        print("[Vurenn] Subscription activated (payment succeeded).")
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
+        subscription_status["active"] = False
+        save_subscription_status(subscription_status)
+        print("[Vurenn] Subscription deactivated.")
+
+    elif event_type == "invoice.payment_failed":
+        subscription_status["active"] = False
+        save_subscription_status(subscription_status)
+        print("[Vurenn] Payment failed — subscription marked inactive.")
+
+    return jsonify({"received": True})
 
 VOICE_HTML = """
 <!DOCTYPE html>
@@ -1213,6 +1474,14 @@ def api_voice():
     if not transcript:
         return jsonify({"stage": "error", "message": "Didn't catch that — try again."})
 
+    # ── Subscription gate ────────────────────────────────────────────────────
+    if REQUIRE_SUBSCRIPTION and not is_subscribed():
+        return jsonify({
+            "stage": "subscription_required",
+            "message": "A subscription is required to use Vurenn.",
+            "subscribe_url": "/subscribe",
+        })
+
     # ── MFA gate ──────────────────────────────────────────────────────────────
     if MFA_ENABLED and not is_authenticated():
         if current_recognized_name is None:
@@ -1247,6 +1516,10 @@ def api_voice():
 if __name__ == "__main__":
     if not ANTHROPIC_API_KEY:
         print("[Vurenn] WARNING: ANTHROPIC_API_KEY not set. General questions won't work.")
+
+    if REQUIRE_SUBSCRIPTION and (not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID):
+        print("[Vurenn] WARNING: STRIPE_SECRET_KEY / STRIPE_PRICE_ID not set. "
+              "Checkout won't work until these are configured.")
 
     load_known_faces()
     init_spotify()
