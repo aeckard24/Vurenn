@@ -43,6 +43,21 @@ FRONTEND_ORIGINS = {
     for value in os.environ.get("FRONTEND_ORIGIN", FRONTEND_URL).split(",")
     if value.strip()
 }
+ADMIN_EMAILS = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "ADMIN_EMAILS", "noahssteiner@icloud.com"
+    ).split(",")
+    if value.strip()
+}
+MAINTENANCE_BYPASS_EMAILS = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "MAINTENANCE_BYPASS_EMAILS",
+        os.environ.get("ADMIN_EMAILS", "noahssteiner@icloud.com"),
+    ).split(",")
+    if value.strip()
+}
 
 anthropic_client = (
     Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -217,6 +232,35 @@ def user_plan(user):
     return plan if plan in {"pro", "premier"} else "free"
 
 
+def user_email(user):
+    return str(user.get("email") or "").strip().lower()
+
+
+def is_admin(user):
+    return user_email(user) in ADMIN_EMAILS
+
+
+def can_bypass_maintenance(user):
+    return user_email(user) in (ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS)
+
+
+def construction_mode_enabled():
+    try:
+        rows = supabase_request(
+            "GET",
+            "app_settings",
+            params={
+                "select": "value",
+                "key": "eq.construction_mode",
+                "limit": "1",
+            },
+        )
+        return bool(rows and (rows[0].get("value") or {}).get("enabled"))
+    except Exception:
+        app.logger.exception("Could not read construction mode")
+        return False
+
+
 def get_credit_account(user_id):
     rows = supabase_request(
         "GET",
@@ -306,6 +350,17 @@ def auth_required(handler):
     return wrapped
 
 
+def admin_required(handler):
+    @wraps(handler)
+    @auth_required
+    def wrapped(*args, **kwargs):
+        if not is_admin(g.user):
+            return api_error(403, "admin_required", "Administrator access required.")
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
 @app.route("/health", methods=["GET"])
 def health():
     checks = {
@@ -341,6 +396,130 @@ def usage_costs():
             ),
         }
     )
+
+
+@app.route("/v1/public/config", methods=["GET"])
+def public_config():
+    return jsonify(
+        {
+            "maintenanceMode": construction_mode_enabled(),
+            "content": {
+                "maintenanceMessage": (
+                    "Vurenn is under construction while we prepare the "
+                    "public launch."
+                )
+            },
+            "fetchedAt": utc_now(),
+        }
+    )
+
+
+@app.route("/v1/maintenance/access", methods=["GET", "OPTIONS"])
+@auth_required
+def maintenance_access():
+    return jsonify(
+        {
+            "enabled": construction_mode_enabled(),
+            "allowed": can_bypass_maintenance(g.user),
+        }
+    )
+
+
+@app.route("/v1/admin/dashboard", methods=["GET", "OPTIONS"])
+@admin_required
+def admin_dashboard():
+    user_response = requests.get(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        params={"page": 1, "per_page": 1000},
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+        timeout=15,
+    )
+    if user_response.status_code >= 400:
+        raise RuntimeError("Could not load Supabase users.")
+    auth_users = user_response.json().get("users", [])
+    subscription_rows = supabase_request(
+        "GET",
+        "subscriptions",
+        params={"select": "plan_id,status"},
+    ) or []
+    purchases = supabase_request(
+        "GET",
+        "credit_purchases",
+        params={"select": "amount_cents,status"},
+    ) or []
+    paid_invoices = stripe.Invoice.list(status="paid", limit=100)
+    subscription_revenue = sum(
+        int(invoice.get("amount_paid") or 0)
+        for invoice in paid_invoices.auto_paging_iter()
+    )
+    credit_revenue = sum(
+        int(item["amount_cents"])
+        for item in purchases
+        if item.get("status") == "completed"
+    )
+    balance = stripe.Balance.retrieve()
+    plans = {"free": len(auth_users), "pro": 0, "premier": 0}
+    for item in subscription_rows:
+        if item.get("status") in {"active", "trialing"}:
+            plan_id = item.get("plan_id")
+            if plan_id in {"pro", "premier"}:
+                plans[plan_id] += 1
+                plans["free"] = max(0, plans["free"] - 1)
+    return jsonify(
+        {
+            "users": [
+                {
+                    "id": item.get("id"),
+                    "email": item.get("email"),
+                    "created_at": item.get("created_at"),
+                    "last_sign_in_at": item.get("last_sign_in_at"),
+                }
+                for item in auth_users
+            ],
+            "total_users": len(auth_users),
+            "plans": plans,
+            "revenue": {
+                "subscription_gross_cents": subscription_revenue,
+                "credit_pack_gross_cents": credit_revenue,
+                "stripe_available": [
+                    {"currency": item.currency, "amount": item.amount}
+                    for item in balance.available
+                ],
+                "stripe_pending": [
+                    {"currency": item.currency, "amount": item.amount}
+                    for item in balance.pending
+                ],
+                "note": (
+                    "Gross Stripe receipts before refunds, disputes, fees, "
+                    "taxes, and transfers."
+                ),
+            },
+            "construction_mode": construction_mode_enabled(),
+        }
+    )
+
+
+@app.route("/v1/admin/construction-mode", methods=["PUT", "OPTIONS"])
+@admin_required
+def update_construction_mode():
+    payload = request.get_json(silent=True) or {}
+    enabled = bool(payload.get("enabled"))
+    supabase_request(
+        "POST",
+        "app_settings",
+        params={"on_conflict": "key"},
+        body={
+            "key": "construction_mode",
+            "value": {"enabled": enabled},
+            "updated_by": g.user_id,
+            "updated_at": utc_now(),
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    return jsonify({"enabled": enabled})
 
 
 @app.route("/v1/credits", methods=["GET", "OPTIONS"])
@@ -586,6 +765,12 @@ def chat_stream():
         else ("chat_fast" if model_id == "vurenn-fast" else "chat_balanced")
     )
     base_cost = USAGE_COSTS[feature_id]["credits"]
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user):
+        return api_error(
+            503,
+            "under_construction",
+            "Vurenn is under construction and not open to the public yet.",
+        )
     if not conversation_id or not user_text:
         return api_error(
             422,

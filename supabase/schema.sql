@@ -88,6 +88,17 @@ create table if not exists public.credit_purchases (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.app_settings (
+  key text primary key,
+  value jsonb not null default '{}'::jsonb,
+  updated_by uuid references auth.users(id) on delete set null,
+  updated_at timestamptz not null default now()
+);
+
+insert into public.app_settings (key, value)
+values ('construction_mode', '{"enabled": false}'::jsonb)
+on conflict (key) do nothing;
+
 create or replace function public.initialize_vurenn_user()
 returns trigger
 language plpgsql
@@ -238,6 +249,7 @@ alter table public.profiles enable row level security;
 alter table public.credit_accounts enable row level security;
 alter table public.credit_ledger enable row level security;
 alter table public.credit_purchases enable row level security;
+alter table public.app_settings enable row level security;
 
 drop policy if exists "Users manage their conversations" on public.conversations;
 create policy "Users manage their conversations"
@@ -284,6 +296,7 @@ revoke all on public.profiles from anon;
 revoke all on public.credit_accounts from anon;
 revoke all on public.credit_ledger from anon;
 revoke all on public.credit_purchases from anon;
+revoke all on public.app_settings from anon, authenticated;
 grant select, insert, update, delete on public.conversations to authenticated;
 grant select, insert, update, delete on public.messages to authenticated;
 grant select on public.subscriptions to authenticated;
