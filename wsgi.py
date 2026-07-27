@@ -23,6 +23,9 @@ ANTHROPIC_MODEL = os.environ.get(
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_EXPECTED_UNIT_AMOUNT = int(
+    os.environ.get("STRIPE_EXPECTED_UNIT_AMOUNT", "999")
+)
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://vurenn.com").rstrip("/")
 FRONTEND_ORIGINS = {
     value.strip().rstrip("/")
@@ -455,6 +458,19 @@ def subscription():
 def create_checkout():
     if not STRIPE_SECRET_KEY or not STRIPE_PRICE_ID:
         return api_error(503, "billing_not_configured", "Billing is unavailable.")
+    price = stripe.Price.retrieve(STRIPE_PRICE_ID)
+    if (
+        not price.get("active")
+        or price.get("currency") != "usd"
+        or price.get("unit_amount") != STRIPE_EXPECTED_UNIT_AMOUNT
+        or (price.get("recurring") or {}).get("interval") != "month"
+    ):
+        return api_error(
+            409,
+            "billing_price_mismatch",
+            "Checkout is paused because the configured Stripe price does not "
+            "match Vurenn Pro's displayed monthly price.",
+        )
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
