@@ -61,8 +61,8 @@ alter table public.profiles
 
 create table if not exists public.credit_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
-  balance integer not null default 20 check (balance >= 0),
-  lifetime_granted integer not null default 20 check (lifetime_granted >= 0),
+  balance integer not null default 2000 check (balance >= 0),
+  lifetime_granted integer not null default 2000 check (lifetime_granted >= 0),
   lifetime_spent integer not null default 0 check (lifetime_spent >= 0),
   updated_at timestamptz not null default now()
 );
@@ -99,6 +99,44 @@ create table if not exists public.app_settings (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.uploaded_files (
+  id text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null,
+  mime_type text not null,
+  size integer not null check (size > 0),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists uploaded_files_user_created_idx
+  on public.uploaded_files (user_id, created_at desc);
+
+alter table public.uploaded_files enable row level security;
+revoke all on public.uploaded_files from public, anon, authenticated;
+grant select, insert, delete on public.uploaded_files to service_role;
+
+alter table public.credit_accounts alter column balance set default 2000;
+alter table public.credit_accounts alter column lifetime_granted set default 2000;
+
+do $$
+begin
+  if not exists (
+    select 1 from public.app_settings where key = 'credit_scale_v2'
+  ) then
+    update public.credit_accounts
+    set balance = balance * 100,
+        lifetime_granted = lifetime_granted * 100,
+        lifetime_spent = lifetime_spent * 100;
+    update public.credit_ledger
+    set delta = delta * 100,
+        balance_after = balance_after * 100;
+    update public.credit_purchases set credits = credits * 100;
+    insert into public.app_settings (key, value)
+    values ('credit_scale_v2', '{"factor":100,"welcome_credits":2000}'::jsonb);
+  end if;
+end;
+$$;
+
 insert into public.app_settings (key, value)
 values ('construction_mode', '{"enabled": false}'::jsonb)
 on conflict (key) do nothing;
@@ -123,7 +161,7 @@ begin
   insert into public.credit_ledger (
     user_id, delta, balance_after, event_type, feature_id, idempotency_key
   )
-  values (new.id, 20, 20, 'welcome_grant', 'signup', 'welcome:' || new.id)
+  values (new.id, 2000, 2000, 'welcome_grant', 'signup', 'welcome:' || new.id)
   on conflict (idempotency_key) do nothing;
   return new;
 end;
@@ -146,7 +184,7 @@ on conflict (user_id) do nothing;
 insert into public.credit_ledger (
   user_id, delta, balance_after, event_type, feature_id, idempotency_key
 )
-select id, 20, 20, 'welcome_grant', 'signup', 'welcome:' || id
+select id, 2000, 2000, 'welcome_grant', 'signup', 'welcome:' || id
 from auth.users
 on conflict (idempotency_key) do nothing;
 
