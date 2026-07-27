@@ -686,6 +686,97 @@ def admin_dashboard():
     )
 
 
+@app.route("/v1/admin/config", methods=["GET", "OPTIONS"])
+@admin_required
+def admin_config():
+    available = anthropic_client is not None
+    return jsonify(
+        {
+            "plans": [
+                {
+                    "id": "free",
+                    "name": "Free Top-off",
+                    "monthly_cents": 0,
+                    "annual_cents": 0,
+                    "status": "active",
+                },
+                {
+                    "id": "pro",
+                    "name": "Pro",
+                    "monthly_cents": PLAN_CATALOG["pro_monthly"]["amount_cents"],
+                    "annual_cents": PLAN_CATALOG["pro_annual"]["amount_cents"],
+                    "status": (
+                        "active"
+                        if STRIPE_PRICES["pro_monthly"]
+                        and STRIPE_PRICES["pro_annual"]
+                        else "misconfigured"
+                    ),
+                },
+                {
+                    "id": "premier",
+                    "name": "Premier",
+                    "monthly_cents": PLAN_CATALOG["premier_monthly"][
+                        "amount_cents"
+                    ],
+                    "annual_cents": PLAN_CATALOG["premier_annual"][
+                        "amount_cents"
+                    ],
+                    "status": (
+                        "active"
+                        if STRIPE_PRICES["premier_monthly"]
+                        and STRIPE_PRICES["premier_annual"]
+                        else "misconfigured"
+                    ),
+                },
+            ],
+            "models": [
+                {
+                    "id": model_id,
+                    "name": {
+                        "vurenn-fast": "Vurenn Fast",
+                        "vurenn": "Vurenn",
+                        "vurenn-max": "Vurenn Max",
+                    }[model_id],
+                    "required_plan": details["required_plan"],
+                    "status": "available" if available else "unavailable",
+                    "minimum_credits": details["base_credits"],
+                }
+                for model_id, details in MODEL_CATALOG.items()
+            ],
+            "features": [
+                {
+                    "id": feature_id,
+                    "name": details["label"],
+                    "description": details["description"],
+                    "available": details["available"],
+                    "minimum_credits": details["credits"],
+                }
+                for feature_id, details in USAGE_COSTS.items()
+            ],
+            "connections": {
+                "authentication": supabase_configured(),
+                "database": supabase_configured(),
+                "assistant": available,
+                "billing": bool(
+                    STRIPE_SECRET_KEY
+                    and all(
+                        STRIPE_PRICES[key]
+                        for key in (
+                            "pro_monthly",
+                            "pro_annual",
+                            "premier_monthly",
+                            "premier_annual",
+                            "credits_50",
+                            "credits_100",
+                        )
+                    )
+                ),
+            },
+            "fetched_at": utc_now(),
+        }
+    )
+
+
 @app.route("/v1/admin/construction-mode", methods=["PUT", "OPTIONS"])
 @admin_required
 def update_construction_mode():
