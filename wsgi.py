@@ -10,6 +10,7 @@ import requests
 import stripe
 from anthropic import Anthropic
 from flask import Flask, Response, g, jsonify, request
+from stripe._error import SignatureVerificationError
 
 
 app = Flask(__name__)
@@ -512,7 +513,7 @@ def stripe_webhook():
             request.headers.get("Stripe-Signature", ""),
             STRIPE_WEBHOOK_SECRET,
         )
-    except (ValueError, stripe.error.SignatureVerificationError):
+    except (ValueError, SignatureVerificationError):
         return api_error(400, "invalid_webhook", "Invalid webhook signature.")
 
     data = event["data"]["object"]
