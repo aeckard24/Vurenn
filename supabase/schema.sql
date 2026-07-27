@@ -41,9 +41,203 @@ create table if not exists public.subscriptions (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.profiles (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null default '',
+  occupation text not null default '',
+  goals text[] not null default '{}'::text[],
+  response_style text not null default 'balanced',
+  onboarding_completed boolean not null default false,
+  onboarding_skipped boolean not null default false,
+  security_prompt_dismissed boolean not null default false,
+  camera_unlock_enabled boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.credit_accounts (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  balance integer not null default 20 check (balance >= 0),
+  lifetime_granted integer not null default 20 check (lifetime_granted >= 0),
+  lifetime_spent integer not null default 0 check (lifetime_spent >= 0),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.credit_ledger (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  delta integer not null,
+  balance_after integer not null check (balance_after >= 0),
+  event_type text not null,
+  feature_id text,
+  idempotency_key text not null unique,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists credit_ledger_user_created_idx
+  on public.credit_ledger (user_id, created_at desc);
+
+create table if not exists public.credit_purchases (
+  stripe_session_id text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  pack_id text not null check (pack_id in ('credits_50', 'credits_100')),
+  credits integer not null check (credits > 0),
+  amount_cents integer not null check (amount_cents > 0),
+  status text not null default 'completed',
+  created_at timestamptz not null default now()
+);
+
+create or replace function public.initialize_vurenn_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+begin
+  insert into public.profiles (user_id, display_name)
+  values (
+    new.id,
+    coalesce(new.raw_user_meta_data->>'display_name', split_part(new.email, '@', 1))
+  )
+  on conflict (user_id) do nothing;
+
+  insert into public.credit_accounts (user_id)
+  values (new.id)
+  on conflict (user_id) do nothing;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, event_type, feature_id, idempotency_key
+  )
+  values (new.id, 20, 20, 'welcome_grant', 'signup', 'welcome:' || new.id)
+  on conflict (idempotency_key) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created_vurenn on auth.users;
+create trigger on_auth_user_created_vurenn
+  after insert on auth.users
+  for each row execute procedure public.initialize_vurenn_user();
+
+insert into public.profiles (user_id, display_name)
+select id, coalesce(raw_user_meta_data->>'display_name', split_part(email, '@', 1))
+from auth.users
+on conflict (user_id) do nothing;
+
+insert into public.credit_accounts (user_id)
+select id from auth.users
+on conflict (user_id) do nothing;
+
+insert into public.credit_ledger (
+  user_id, delta, balance_after, event_type, feature_id, idempotency_key
+)
+select id, 20, 20, 'welcome_grant', 'signup', 'welcome:' || id
+from auth.users
+on conflict (idempotency_key) do nothing;
+
+create or replace function public.spend_vurenn_credits(
+  p_user_id uuid,
+  p_amount integer,
+  p_feature_id text,
+  p_idempotency_key text,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns integer
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  next_balance integer;
+  existing_balance integer;
+begin
+  if p_amount <= 0 then
+    raise exception 'Credit amount must be positive';
+  end if;
+
+  select balance_after into existing_balance
+  from public.credit_ledger
+  where idempotency_key = p_idempotency_key;
+  if found then
+    return existing_balance;
+  end if;
+
+  update public.credit_accounts
+  set balance = balance - p_amount,
+      lifetime_spent = lifetime_spent + p_amount,
+      updated_at = now()
+  where user_id = p_user_id and balance >= p_amount
+  returning balance into next_balance;
+
+  if next_balance is null then
+    raise exception 'INSUFFICIENT_CREDITS';
+  end if;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, event_type, feature_id,
+    idempotency_key, metadata
+  ) values (
+    p_user_id, -p_amount, next_balance, 'usage', p_feature_id,
+    p_idempotency_key, coalesce(p_metadata, '{}'::jsonb)
+  );
+  return next_balance;
+end;
+$$;
+
+create or replace function public.grant_vurenn_credits(
+  p_user_id uuid,
+  p_amount integer,
+  p_feature_id text,
+  p_idempotency_key text,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns integer
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  next_balance integer;
+  existing_balance integer;
+begin
+  if p_amount <= 0 then
+    raise exception 'Credit amount must be positive';
+  end if;
+
+  select balance_after into existing_balance
+  from public.credit_ledger
+  where idempotency_key = p_idempotency_key;
+  if found then
+    return existing_balance;
+  end if;
+
+  insert into public.credit_accounts (user_id)
+  values (p_user_id)
+  on conflict (user_id) do nothing;
+
+  update public.credit_accounts
+  set balance = balance + p_amount,
+      lifetime_granted = lifetime_granted + p_amount,
+      updated_at = now()
+  where user_id = p_user_id
+  returning balance into next_balance;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, event_type, feature_id,
+    idempotency_key, metadata
+  ) values (
+    p_user_id, p_amount, next_balance, 'purchase', p_feature_id,
+    p_idempotency_key, coalesce(p_metadata, '{}'::jsonb)
+  );
+  return next_balance;
+end;
+$$;
+
 alter table public.conversations enable row level security;
 alter table public.messages enable row level security;
 alter table public.subscriptions enable row level security;
+alter table public.profiles enable row level security;
+alter table public.credit_accounts enable row level security;
+alter table public.credit_ledger enable row level security;
+alter table public.credit_purchases enable row level security;
 
 drop policy if exists "Users manage their conversations" on public.conversations;
 create policy "Users manage their conversations"
@@ -62,9 +256,38 @@ create policy "Users read their subscription"
   on public.subscriptions for select
   using (auth.uid() = user_id);
 
+drop policy if exists "Users manage their profile" on public.profiles;
+create policy "Users manage their profile"
+  on public.profiles for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+drop policy if exists "Users read their credit account" on public.credit_accounts;
+create policy "Users read their credit account"
+  on public.credit_accounts for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users read their credit ledger" on public.credit_ledger;
+create policy "Users read their credit ledger"
+  on public.credit_ledger for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "Users read their credit purchases" on public.credit_purchases;
+create policy "Users read their credit purchases"
+  on public.credit_purchases for select
+  using (auth.uid() = user_id);
+
 revoke all on public.conversations from anon;
 revoke all on public.messages from anon;
 revoke all on public.subscriptions from anon;
+revoke all on public.profiles from anon;
+revoke all on public.credit_accounts from anon;
+revoke all on public.credit_ledger from anon;
+revoke all on public.credit_purchases from anon;
 grant select, insert, update, delete on public.conversations to authenticated;
 grant select, insert, update, delete on public.messages to authenticated;
 grant select on public.subscriptions to authenticated;
+grant select, insert, update on public.profiles to authenticated;
+grant select on public.credit_accounts to authenticated;
+grant select on public.credit_ledger to authenticated;
+grant select on public.credit_purchases to authenticated;
