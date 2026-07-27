@@ -104,6 +104,23 @@ def supabase_request(method, path, *, params=None, body=None, prefer=None):
     return response.json()
 
 
+def update_user_plan(user_id, plan_id):
+    response = requests.put(
+        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"app_metadata": {"plan": plan_id}},
+        timeout=15,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Could not update the user's plan ({response.status_code})."
+        )
+
+
 def authenticate():
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):
@@ -476,7 +493,7 @@ def create_checkout():
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         customer_email=g.user.get("email"),
-        success_url=f"{FRONTEND_URL}/settings/subscription?checkout=success",
+        success_url=f"{FRONTEND_URL}/settings?checkout=success",
         cancel_url=f"{FRONTEND_URL}/pricing?checkout=canceled",
         allow_promotion_codes=True,
         metadata={"user_id": g.user_id, "plan_id": "pro"},
@@ -500,6 +517,7 @@ def upsert_subscription(user_id, values):
         body=row,
         prefer="resolution=merge-duplicates,return=minimal",
     )
+    update_user_plan(user_id, row["plan_id"])
 
 
 @app.route("/webhook", methods=["POST"])
