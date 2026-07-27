@@ -51,9 +51,13 @@ create table if not exists public.profiles (
   onboarding_skipped boolean not null default false,
   security_prompt_dismissed boolean not null default false,
   camera_unlock_enabled boolean not null default false,
+  limited_test_mode boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.profiles
+  add column if not exists limited_test_mode boolean not null default false;
 
 create table if not exists public.credit_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
@@ -167,7 +171,8 @@ begin
 
   select balance_after into existing_balance
   from public.credit_ledger
-  where idempotency_key = p_idempotency_key;
+  where idempotency_key = p_idempotency_key
+    and user_id = p_user_id;
   if found then
     return existing_balance;
   end if;
@@ -215,7 +220,8 @@ begin
 
   select balance_after into existing_balance
   from public.credit_ledger
-  where idempotency_key = p_idempotency_key;
+  where idempotency_key = p_idempotency_key
+    and user_id = p_user_id;
   if found then
     return existing_balance;
   end if;
@@ -236,6 +242,55 @@ begin
     idempotency_key, metadata
   ) values (
     p_user_id, p_amount, next_balance, 'purchase', p_feature_id,
+    p_idempotency_key, coalesce(p_metadata, '{}'::jsonb)
+  );
+  return next_balance;
+end;
+$$;
+
+create or replace function public.refund_vurenn_credits(
+  p_user_id uuid,
+  p_amount integer,
+  p_feature_id text,
+  p_idempotency_key text,
+  p_metadata jsonb default '{}'::jsonb
+)
+returns integer
+language plpgsql
+security definer set search_path = public
+as $$
+declare
+  next_balance integer;
+  existing_balance integer;
+begin
+  if p_amount <= 0 then
+    raise exception 'Credit amount must be positive';
+  end if;
+
+  select balance_after into existing_balance
+  from public.credit_ledger
+  where idempotency_key = p_idempotency_key
+    and user_id = p_user_id;
+  if found then
+    return existing_balance;
+  end if;
+
+  update public.credit_accounts
+  set balance = balance + p_amount,
+      lifetime_spent = greatest(0, lifetime_spent - p_amount),
+      updated_at = now()
+  where user_id = p_user_id
+  returning balance into next_balance;
+
+  if next_balance is null then
+    raise exception 'Credit account not found';
+  end if;
+
+  insert into public.credit_ledger (
+    user_id, delta, balance_after, event_type, feature_id,
+    idempotency_key, metadata
+  ) values (
+    p_user_id, p_amount, next_balance, 'refund', p_feature_id,
     p_idempotency_key, coalesce(p_metadata, '{}'::jsonb)
   );
   return next_balance;
@@ -304,3 +359,22 @@ grant select, insert, update on public.profiles to authenticated;
 grant select on public.credit_accounts to authenticated;
 grant select on public.credit_ledger to authenticated;
 grant select on public.credit_purchases to authenticated;
+
+revoke all on function public.spend_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) from public, anon, authenticated;
+revoke all on function public.grant_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) from public, anon, authenticated;
+revoke all on function public.refund_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) from public, anon, authenticated;
+grant execute on function public.spend_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) to service_role;
+grant execute on function public.grant_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) to service_role;
+grant execute on function public.refund_vurenn_credits(
+  uuid, integer, text, text, jsonb
+) to service_role;
