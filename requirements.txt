@@ -1,0 +1,7 @@
+Flask
+requests
+anthropic
+stripe
+edge-tts
+SpeechRecognition
+sympy

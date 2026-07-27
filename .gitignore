@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+generated_audio/
+delta_known_faces.pkl
+delta_passphrase.hash
+subscription_status.json
+voice_config.json
