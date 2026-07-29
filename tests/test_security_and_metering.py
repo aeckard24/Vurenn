@@ -6,6 +6,25 @@ import wsgi
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_provider_capacity_errors_use_a_fast_fallback(self):
+        requested = wsgi.MODEL_CATALOG["vurenn"]["provider_model"]
+        attempts = wsgi.provider_model_attempts(requested)
+        self.assertEqual(attempts[0], requested)
+        self.assertEqual(
+            attempts[-1],
+            wsgi.MODEL_CATALOG["vurenn-fast"]["provider_model"],
+        )
+
+        class OverloadedError(Exception):
+            status_code = 529
+
+        self.assertTrue(
+            wsgi.is_provider_capacity_error(OverloadedError("Overloaded"))
+        )
+        self.assertFalse(
+            wsgi.is_provider_capacity_error(ValueError("bad request"))
+        )
+
     def test_provider_identity_and_credentials_are_sanitized(self):
         value = wsgi.sanitize_assistant_text(
             "I am Claude from Anthropic. sk_test_abcdefghijklmnop"

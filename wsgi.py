@@ -204,6 +204,34 @@ MODEL_CATALOG = {
         ),
     },
 }
+
+
+def provider_model_attempts(requested_model):
+    fallback_model = MODEL_CATALOG["vurenn-fast"]["provider_model"]
+    attempts = [requested_model]
+    if fallback_model != requested_model:
+        attempts.append(fallback_model)
+    else:
+        attempts.append(requested_model)
+    return attempts
+
+
+def is_provider_capacity_error(error):
+    status_code = getattr(error, "status_code", None)
+    if status_code in {429, 500, 502, 503, 529}:
+        return True
+    description = str(error).lower()
+    return any(
+        marker in description
+        for marker in (
+            "overloaded",
+            "overloaded_error",
+            "rate_limit_error",
+            "temporarily unavailable",
+        )
+    )
+
+
 PLAN_RANK = {"free": 0, "pro": 1, "premier": 2}
 _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
@@ -3125,12 +3153,42 @@ def chat_stream():
                 }
                 if provider_tools:
                     create_kwargs["tools"] = provider_tools
-                if owned_attachments:
-                    final = anthropic_client.beta.messages.create(
-                        **create_kwargs, betas=["files-api-2025-04-14"]
-                    )
-                else:
-                    final = anthropic_client.messages.create(**create_kwargs)
+                provider_error = None
+                for attempt, provider_model in enumerate(
+                    provider_model_attempts(model["provider_model"])
+                ):
+                    create_kwargs["model"] = provider_model
+                    try:
+                        if owned_attachments:
+                            final = anthropic_client.beta.messages.create(
+                                **create_kwargs,
+                                betas=["files-api-2025-04-14"],
+                            )
+                        else:
+                            final = anthropic_client.messages.create(
+                                **create_kwargs
+                            )
+                        provider_error = None
+                        break
+                    except Exception as error:
+                        provider_error = error
+                        if (
+                            not is_provider_capacity_error(error)
+                            or attempt
+                            == len(
+                                provider_model_attempts(
+                                    model["provider_model"]
+                                )
+                            )
+                            - 1
+                        ):
+                            raise
+                        app.logger.warning(
+                            "Provider model overloaded; retrying with fallback"
+                        )
+                        time.sleep(0.75)
+                if provider_error is not None:
+                    raise provider_error
                 for block in final.content:
                     block_data = (
                         block.model_dump()
@@ -3168,43 +3226,72 @@ def chat_stream():
                         },
                     )
             else:
-                with anthropic_client.messages.stream(
-                    model=model["provider_model"],
-                    max_tokens=(
-                        min(model["max_tokens"], 160)
-                        if voice_mode
-                        else model["max_tokens"]
-                    ),
-                    system=system_prompt,
-                    messages=model_messages,
-                ) as response_stream:
-                    for text in response_stream.text_stream:
-                        pending_text += text
-                        stream_chunk_size = 36 if voice_mode else 120
-                        if len(pending_text) > stream_chunk_size:
-                            cutoff = max(
-                                pending_text.rfind(
-                                    char,
-                                    0,
-                                    len(pending_text)
-                                    - (12 if voice_mode else 32),
+                provider_error = None
+                attempt_models = provider_model_attempts(
+                    model["provider_model"]
+                )
+                for attempt, provider_model in enumerate(attempt_models):
+                    try:
+                        with anthropic_client.messages.stream(
+                            model=provider_model,
+                            max_tokens=(
+                                min(model["max_tokens"], 160)
+                                if voice_mode
+                                else model["max_tokens"]
+                            ),
+                            system=system_prompt,
+                            messages=model_messages,
+                        ) as response_stream:
+                            for text in response_stream.text_stream:
+                                pending_text += text
+                                stream_chunk_size = (
+                                    36 if voice_mode else 120
                                 )
-                                for char in (" ", "\n", "\t")
-                            )
-                        else:
-                            cutoff = -1
-                        if cutoff >= 0:
-                            safe_text = prepare_reply_text(
-                                pending_text[: cutoff + 1]
-                            )
-                            pending_text = pending_text[cutoff + 1 :]
-                            full_text.append(safe_text)
-                            yield sse("token", {"text": safe_text})
-                    final = response_stream.get_final_message()
-                    if pending_text:
-                        safe_text = prepare_reply_text(pending_text)
-                        full_text.append(safe_text)
-                        yield sse("token", {"text": safe_text})
+                                if len(pending_text) > stream_chunk_size:
+                                    cutoff = max(
+                                        pending_text.rfind(
+                                            char,
+                                            0,
+                                            len(pending_text)
+                                            - (12 if voice_mode else 32),
+                                        )
+                                        for char in (" ", "\n", "\t")
+                                    )
+                                else:
+                                    cutoff = -1
+                                if cutoff >= 0:
+                                    safe_text = prepare_reply_text(
+                                        pending_text[: cutoff + 1]
+                                    )
+                                    pending_text = pending_text[cutoff + 1 :]
+                                    full_text.append(safe_text)
+                                    yield sse(
+                                        "token", {"text": safe_text}
+                                    )
+                            final = response_stream.get_final_message()
+                            if pending_text:
+                                safe_text = prepare_reply_text(pending_text)
+                                full_text.append(safe_text)
+                                yield sse("token", {"text": safe_text})
+                                pending_text = ""
+                        provider_error = None
+                        break
+                    except Exception as error:
+                        provider_error = error
+                        can_retry = (
+                            is_provider_capacity_error(error)
+                            and not full_text
+                            and not pending_text
+                            and attempt < len(attempt_models) - 1
+                        )
+                        if not can_retry:
+                            raise
+                        app.logger.warning(
+                            "Provider stream overloaded; retrying with fallback"
+                        )
+                        time.sleep(0.75)
+                if provider_error is not None:
+                    raise provider_error
             if local_answer is None:
                 usage_data = (
                     final.usage.model_dump()
@@ -3272,7 +3359,7 @@ def chat_stream():
                     "credits_remaining": balance_after,
                 },
             )
-        except Exception:
+        except Exception as error:
             app.logger.exception("Assistant streaming failed")
             if metered:
                 try:
@@ -3288,8 +3375,16 @@ def chat_stream():
             yield sse(
                 "error",
                 {
-                    "code": "assistant_error",
-                    "message": "Vurenn could not complete the response.",
+                    "code": (
+                        "provider_busy"
+                        if is_provider_capacity_error(error)
+                        else "assistant_error"
+                    ),
+                    "message": (
+                        "Vurenn is temporarily busy. Please retry in a moment."
+                        if is_provider_capacity_error(error)
+                        else "Vurenn could not complete the response."
+                    ),
                     "retryable": True,
                 },
             )
