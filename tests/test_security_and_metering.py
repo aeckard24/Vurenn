@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 
 import wsgi
 
@@ -49,6 +50,53 @@ class SecurityAndMeteringTests(unittest.TestCase):
 
     def test_voice_does_not_add_a_separate_credit_charge(self):
         self.assertEqual(wsgi.USAGE_COSTS["voice_turn"]["credits"], 0)
+
+    def test_local_arithmetic_uses_restricted_evaluator(self):
+        self.assertEqual(
+            wsgi.local_utility_response("calculate 2 + 2"),
+            "The answer is 4.",
+        )
+        self.assertEqual(
+            wsgi.local_utility_response("what is 12 squared"),
+            "The answer is 144.",
+        )
+        with self.assertRaises(ValueError):
+            wsgi.safe_calculate("__import__('os').system('whoami')")
+
+    def test_local_square_root_and_time_responses(self):
+        self.assertEqual(
+            wsgi.local_utility_response("square root of 144"),
+            "The square root of 144 is 12.",
+        )
+        response = wsgi.local_utility_response(
+            "what time is it",
+            now=datetime(2026, 7, 29, 15, 4, tzinfo=timezone.utc),
+        )
+        self.assertEqual(response, "The current UTC time is 15:04 UTC.")
+
+    def test_local_youtube_search_encodes_the_query(self):
+        self.assertEqual(
+            wsgi.local_utility_response("search YouTube for jazz & blues"),
+            (
+                "Here’s a YouTube search for that: "
+                "https://www.youtube.com/results?search_query=jazz+%26+blues"
+            ),
+        )
+
+    def test_local_response_has_a_lower_minimum_cost(self):
+        self.assertLess(
+            wsgi.LOCAL_RESPONSE_CREDITS,
+            wsgi.MODEL_CATALOG["vurenn-fast"]["base_credits"],
+        )
+        self.assertEqual(
+            wsgi.credits_for_usage(
+                wsgi.MODEL_CATALOG["vurenn"],
+                0,
+                0,
+                minimum_credits=wsgi.LOCAL_RESPONSE_CREDITS,
+            ),
+            wsgi.LOCAL_RESPONSE_CREDITS,
+        )
 
     def test_response_preferences_are_bounded(self):
         preferences = wsgi.normalize_response_preferences(

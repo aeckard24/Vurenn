@@ -1,9 +1,11 @@
 """Production HTTP API for the Vurenn web frontend."""
 
+import ast
 import io
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import secrets
@@ -16,6 +18,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import requests
 import stripe
@@ -86,6 +89,9 @@ COST_BUDGET_PER_CREDIT_USD = float(
 )
 PLATFORM_OVERHEAD_USD = float(
     os.environ.get("PLATFORM_OVERHEAD_USD", "0.004")
+)
+LOCAL_RESPONSE_CREDITS = int(
+    os.environ.get("LOCAL_RESPONSE_CREDITS", "5")
 )
 MAX_MESSAGE_CHARS = int(os.environ.get("MAX_MESSAGE_CHARS", "20000"))
 MAX_ATTACHMENTS = int(os.environ.get("MAX_ATTACHMENTS", "5"))
@@ -642,6 +648,151 @@ def selected_tool_configuration(tool_ids):
                 provider_tools.append(provider_tool)
                 seen_provider_types.add(provider_type)
     return provider_tools, system_parts, feature_ids
+
+
+_SAFE_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_SAFE_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_MAX_LOCAL_NUMBER = 1_000_000_000_000_000
+
+
+def safe_calculate(expression):
+    """Evaluate basic arithmetic without executing names, calls, or attributes."""
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("An arithmetic expression is required.")
+    if len(expression) > 120:
+        raise ValueError("The arithmetic expression is too long.")
+    tree = ast.parse(expression, mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > 50:
+        raise ValueError("The arithmetic expression is too complex.")
+
+    def evaluate(node):
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(
+                node.value, (int, float)
+            ):
+                raise ValueError("Only numbers are supported.")
+            result = node.value
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_UNARY_OPERATORS:
+            result = _SAFE_UNARY_OPERATORS[type(node.op)](evaluate(node.operand))
+        elif isinstance(node, ast.BinOp) and type(node.op) in _SAFE_BINARY_OPERATORS:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 12:
+                raise ValueError("That exponent is too large.")
+            result = _SAFE_BINARY_OPERATORS[type(node.op)](left, right)
+        else:
+            raise ValueError("Only basic arithmetic is supported.")
+        if not math.isfinite(float(result)) or abs(result) > _MAX_LOCAL_NUMBER:
+            raise ValueError("The result is outside the supported range.")
+        return result
+
+    return evaluate(tree)
+
+
+def format_local_number(value):
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:.10f}".rstrip("0").rstrip(".")
+
+
+def local_utility_response(message, now=None):
+    """Return a deterministic response for small tasks that need no AI call."""
+    text = str(message or "").strip()
+    lowered = text.lower()
+    current_time = now or datetime.now(timezone.utc)
+
+    if lowered.rstrip("?.") in {
+        "time",
+        "time now",
+        "current time",
+        "what time is it",
+        "what is the time",
+        "what's the time",
+    }:
+        return f"The current UTC time is {current_time:%H:%M} UTC."
+    if re.fullmatch(
+        r"(?:what(?:'s| is) )?(?:today'?s|the current)? ?date[?.]?",
+        lowered,
+    ):
+        return (
+            f"Today is {current_time:%A, %B} {current_time.day}, "
+            f"{current_time:%Y} (UTC)."
+        )
+
+    youtube_match = re.fullmatch(
+        r"(?:search )?youtube(?: for)?\s+(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if youtube_match:
+        query = youtube_match.group(1).strip()
+        if query:
+            return (
+                "Here’s a YouTube search for that: "
+                "https://www.youtube.com/results?search_query="
+                f"{quote_plus(query)}"
+            )
+
+    square_root_match = re.fullmatch(
+        r"(?:what(?:'s| is) )?(?:the )?(?:square root of|sqrt\s*\()\s*"
+        r"(-?\d+(?:\.\d+)?)\s*\)?[?.]?",
+        lowered,
+    )
+    if square_root_match:
+        number = float(square_root_match.group(1))
+        if number < 0:
+            return "That number does not have a real square root."
+        return (
+            f"The square root of {format_local_number(number)} is "
+            f"{format_local_number(math.sqrt(number))}."
+        )
+
+    expression = lowered
+    for prefix in (
+        "what is ",
+        "what's ",
+        "whats ",
+        "calculate ",
+        "compute ",
+        "evaluate ",
+        "work out ",
+    ):
+        if expression.startswith(prefix):
+            expression = expression[len(prefix) :]
+            break
+    expression = expression.strip().rstrip("?.")
+    expression = re.sub(r"(\d+(?:\.\d+)?)\s+squared\b", r"\1**2", expression)
+    expression = re.sub(r"(\d+(?:\.\d+)?)\s+cubed\b", r"\1**3", expression)
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s+to the power of\s+(-?\d+(?:\.\d+)?)",
+        r"\1**\2",
+        expression,
+    )
+    expression = expression.replace("×", "*").replace("÷", "/").replace("^", "**")
+    if (
+        re.fullmatch(r"[\d\s+\-*/%().]+", expression)
+        and re.search(r"\d", expression)
+        and re.search(r"[+\-*/%]", expression)
+    ):
+        try:
+            result = safe_calculate(expression)
+        except (ArithmeticError, SyntaxError, TypeError, ValueError):
+            return None
+        return f"The answer is {format_local_number(result)}."
+    return None
 
 
 def sanitize_assistant_text(value):
@@ -1816,13 +1967,6 @@ def chat_stream():
     conversation = get_owned_conversation(conversation_id, g.user_id)
     if not conversation:
         return api_error(404, "conversation_not_found", "Conversation not found.")
-    if not anthropic_client:
-        return api_error(
-            503,
-            "assistant_not_configured",
-            "Vurenn's response service is not configured.",
-            retryable=True,
-        )
     metered = effective_plan == "free"
     starting_balance = None
 
@@ -1864,7 +2008,25 @@ def chat_stream():
         owned_attachments.append(owned)
     if owned_attachments and "file_analysis" not in tool_feature_ids:
         tool_feature_ids.append("file_analysis")
-    minimum_credits = model["base_credits"]
+    local_answer = (
+        local_utility_response(user_text)
+        if not requested_tools and not owned_attachments
+        else None
+    )
+    if not anthropic_client and local_answer is None:
+        return api_error(
+            503,
+            "assistant_not_configured",
+            "Vurenn's response service is not configured.",
+            retryable=True,
+        )
+    if local_answer is not None:
+        feature_id = "local_utility"
+    minimum_credits = (
+        LOCAL_RESPONSE_CREDITS
+        if local_answer is not None
+        else model["base_credits"]
+    )
     if voice_mode:
         minimum_credits += USAGE_COSTS["voice_turn"]["credits"]
     for selected_feature_id in tool_feature_ids:
@@ -1882,9 +2044,9 @@ def chat_stream():
     ) + 2000
     reserved_credits = credits_for_usage(
         model,
-        estimated_input_tokens,
-        model["max_tokens"],
-        history_items=len(previous),
+        0 if local_answer is not None else estimated_input_tokens,
+        0 if local_answer is not None else model["max_tokens"],
+        history_items=0 if local_answer is not None else len(previous),
         attachment_count=len(attachments),
         minimum_credits=minimum_credits,
     )
@@ -2047,7 +2209,12 @@ def chat_stream():
         balance_after = starting_balance
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
-            if requested_tools or owned_attachments:
+            if local_answer is not None:
+                safe_text = sanitize_assistant_text(local_answer)
+                full_text.append(safe_text)
+                yield sse("token", {"text": safe_text})
+                usage_data = {}
+            elif requested_tools or owned_attachments:
                 for tool_id in requested_tools:
                     yield sse(
                         "tool_started",
@@ -2133,11 +2300,12 @@ def chat_stream():
                         safe_text = sanitize_assistant_text(pending_text)
                         full_text.append(safe_text)
                         yield sse("token", {"text": safe_text})
-            usage_data = (
-                final.usage.model_dump()
-                if hasattr(final.usage, "model_dump")
-                else dict(final.usage)
-            )
+            if local_answer is None:
+                usage_data = (
+                    final.usage.model_dump()
+                    if hasattr(final.usage, "model_dump")
+                    else dict(final.usage)
+                )
             usage = {
                 "input_tokens": int(usage_data.get("input_tokens", 0) or 0),
                 "output_tokens": int(usage_data.get("output_tokens", 0) or 0),
@@ -2265,8 +2433,7 @@ def developer_chat():
         return api_error(422, "unknown_model", "That Vurenn mode is unavailable.")
     if not model_allowed(user_plan(g.user, g.user_id), model):
         return api_error(403, "plan_required", "This Vurenn mode requires a higher plan.")
-    if not anthropic_client:
-        return api_error(503, "assistant_not_configured", "Vurenn is unavailable.", retryable=True)
+    local_answer = local_utility_response(user_text)
 
     category = safety_category(user_text)
     if category == "self_harm":
@@ -2295,6 +2462,13 @@ def developer_chat():
             ),
             details={"category": category},
         )
+    if not anthropic_client and local_answer is None:
+        return api_error(
+            503,
+            "assistant_not_configured",
+            "Vurenn is unavailable.",
+            retryable=True,
+        )
 
     profile_rows = supabase_request(
         "GET",
@@ -2306,12 +2480,21 @@ def developer_chat():
         },
     ) or []
     profile = profile_rows[0] if profile_rows else {}
-    estimated_input = max(1, math.ceil(len(user_text) / 2)) + 500
+    estimated_input = (
+        0
+        if local_answer is not None
+        else max(1, math.ceil(len(user_text) / 2)) + 500
+    )
+    minimum_credits = (
+        LOCAL_RESPONSE_CREDITS
+        if local_answer is not None
+        else model["base_credits"]
+    )
     reserved = credits_for_usage(
         model,
         estimated_input,
-        model["max_tokens"],
-        minimum_credits=model["base_credits"],
+        0 if local_answer is not None else model["max_tokens"],
+        minimum_credits=minimum_credits,
     )
     request_id = (
         request.headers.get("X-Idempotency-Key") or uuid.uuid4().hex
@@ -2343,30 +2526,35 @@ def developer_chat():
         f"{response_preference_prompt(profile.get('response_preferences'))}"
     )
     try:
-        result = anthropic_client.messages.create(
-            model=model["provider_model"],
-            max_tokens=model["max_tokens"],
-            system=system,
-            messages=[{"role": "user", "content": user_text}],
-        )
-        output = "".join(
-            str(block.text)
-            for block in result.content
-            if getattr(block, "type", "") == "text"
-        )
-        output = sanitize_assistant_text(output)
-        usage_data = (
-            result.usage.model_dump()
-            if hasattr(result.usage, "model_dump")
-            else dict(result.usage)
-        )
-        input_tokens = int(usage_data.get("input_tokens", 0) or 0)
-        output_tokens = int(usage_data.get("output_tokens", 0) or 0)
+        if local_answer is not None:
+            output = sanitize_assistant_text(local_answer)
+            input_tokens = 0
+            output_tokens = 0
+        else:
+            result = anthropic_client.messages.create(
+                model=model["provider_model"],
+                max_tokens=model["max_tokens"],
+                system=system,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            output = "".join(
+                str(block.text)
+                for block in result.content
+                if getattr(block, "type", "") == "text"
+            )
+            output = sanitize_assistant_text(output)
+            usage_data = (
+                result.usage.model_dump()
+                if hasattr(result.usage, "model_dump")
+                else dict(result.usage)
+            )
+            input_tokens = int(usage_data.get("input_tokens", 0) or 0)
+            output_tokens = int(usage_data.get("output_tokens", 0) or 0)
         actual = credits_for_usage(
             model,
             input_tokens,
             output_tokens,
-            minimum_credits=model["base_credits"],
+            minimum_credits=minimum_credits,
         )
         refund = max(0, reserved - actual)
         if refund:
