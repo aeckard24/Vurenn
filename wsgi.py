@@ -2251,7 +2251,7 @@ def uploaded_file(file_id):
     return "", 204
 
 
-@app.route("/v1/conversations", methods=["GET", "POST", "OPTIONS"])
+@app.route("/v1/conversations", methods=["GET", "POST", "DELETE", "OPTIONS"])
 @auth_required
 def conversation_collection():
     if request.method == "GET":
@@ -2267,6 +2267,21 @@ def conversation_collection():
             },
         )
         return jsonify({"conversations": rows or []})
+    if request.method == "DELETE":
+        rows = supabase_request(
+            "GET",
+            "conversations",
+            params={
+                "select": "id",
+                "user_id": f"eq.{g.user_id}",
+            },
+        ) or []
+        supabase_request(
+            "DELETE",
+            "conversations",
+            params={"user_id": f"eq.{g.user_id}"},
+        )
+        return jsonify({"deleted": len(rows)})
 
     payload = request.get_json(silent=True) or {}
     conversation_id = str(payload.get("temporary_id") or uuid.uuid4())
@@ -2305,6 +2320,25 @@ def conversation_collection():
             )
         }
     ), 201
+
+
+@app.route(
+    "/v1/conversations/<conversation_id>",
+    methods=["DELETE", "OPTIONS"],
+)
+@auth_required
+def conversation_item(conversation_id):
+    if not get_owned_conversation(conversation_id, g.user_id):
+        return api_error(404, "conversation_not_found", "Conversation not found.")
+    supabase_request(
+        "DELETE",
+        "conversations",
+        params={
+            "id": f"eq.{conversation_id}",
+            "user_id": f"eq.{g.user_id}",
+        },
+    )
+    return "", 204
 
 
 @app.route(

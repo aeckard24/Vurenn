@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import wsgi
 
@@ -186,6 +187,30 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(len(content["intro"]), 600)
         self.assertEqual(content["updates"][0]["title"], "A real update")
         self.assertEqual(content["team"][0]["name"], "Kendric")
+
+    def test_conversation_delete_is_scoped_to_its_owner(self):
+        with wsgi.app.test_request_context(
+            "/v1/conversations/conversation-1",
+            method="DELETE",
+        ):
+            wsgi.g.user_id = "user-1"
+            wsgi.g.user = {"id": "user-1", "email": "owner@example.com"}
+            with patch.object(
+                wsgi,
+                "get_owned_conversation",
+                return_value={"id": "conversation-1", "user_id": "user-1"},
+            ), patch.object(wsgi, "supabase_request") as database:
+                response = wsgi.conversation_item.__wrapped__("conversation-1")
+
+        self.assertEqual(response, ("", 204))
+        database.assert_called_once_with(
+            "DELETE",
+            "conversations",
+            params={
+                "id": "eq.conversation-1",
+                "user_id": "eq.user-1",
+            },
+        )
 
     def test_safety_classifier_distinguishes_support_from_harm(self):
         self.assertEqual(
