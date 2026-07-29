@@ -60,6 +60,7 @@ create table if not exists public.profiles (
     "custom_instructions": "",
     "voice_id": "af_heart",
     "appearance": {
+      "color_theme": "classic",
       "accent": "blue",
       "gradient": "solid",
       "atmosphere": "none",
@@ -92,6 +93,7 @@ alter table public.profiles
     "custom_instructions": "",
     "voice_id": "af_heart",
     "appearance": {
+      "color_theme": "classic",
       "accent": "blue",
       "gradient": "solid",
       "atmosphere": "none",

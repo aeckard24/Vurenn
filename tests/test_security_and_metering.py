@@ -43,6 +43,20 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("code_execution_20260521", provider_types)
         self.assertIn("deep_research", feature_ids)
 
+    def test_tools_are_inferred_from_natural_requests(self):
+        self.assertEqual(
+            wsgi.infer_requested_tools("Please search the web for current information"),
+            ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools("Deep research this market for me"),
+            ["deep_research"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools("Explain this", has_attachments=True),
+            ["file_analysis"],
+        )
+
     def test_only_approved_email_is_a_team_member(self):
         approved = next(iter(wsgi.TEAM_EMAILS))
         self.assertTrue(wsgi.is_team({"email": approved}))
@@ -136,6 +150,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
         preferences = wsgi.normalize_response_preferences(
             {
                 "appearance": {
+                    "color_theme": "aurora",
                     "accent": "rose",
                     "gradient": "sunset",
                     "atmosphere": "mesh",
@@ -145,6 +160,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
             }
         )
         self.assertEqual(preferences["appearance"]["accent"], "rose")
+        self.assertEqual(preferences["appearance"]["color_theme"], "aurora")
         self.assertEqual(preferences["appearance"]["gradient"], "sunset")
         invalid = wsgi.normalize_response_preferences(
             {"appearance": {"accent": "javascript:red", "gradient": "url"}}

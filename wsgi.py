@@ -101,6 +101,12 @@ CHAT_RATE_LIMIT_PER_MINUTE = int(
 TTS_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("TTS_RATE_LIMIT_PER_MINUTE", "10")
 )
+VOICE_ENABLED = os.environ.get("VOICE_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "2200"))
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.02"))
@@ -190,8 +196,10 @@ MODEL_CATALOG = {
         "base_credits": 180,
         "max_tokens": 6000,
         "style": (
-            "Use premium deep reasoning. Work through ambiguity, check your "
-            "conclusions, and deliver a rigorous, complete answer."
+            "Use premium deep reasoning. Privately analyze the problem from "
+            "multiple angles before answering. Check assumptions and conclusions, "
+            "surface important tradeoffs, and deliver a rigorous, in-depth answer "
+            "with clear sections, examples, and practical next steps."
         ),
     },
 }
@@ -376,6 +384,7 @@ DEFAULT_RESPONSE_PREFERENCES = {
     "custom_instructions": "",
     "voice_id": "af_heart",
     "appearance": {
+        "color_theme": "classic",
         "accent": "blue",
         "gradient": "solid",
         "atmosphere": "none",
@@ -393,10 +402,10 @@ DEFAULT_JOURNAL_CONTENT = {
         {
             "date": "July 29, 2026",
             "category": "Product",
-            "title": "Live voice, rebuilt",
+            "title": "Voice enters quality testing",
             "summary": (
-                "A focused conversation screen, faster turn-taking, cleaner "
-                "spoken replies, and controls that stay out of the way."
+                "Voice is marked Coming Soon while the team improves response "
+                "speed, turn-taking, and natural speech quality."
             ),
         },
         {
@@ -486,6 +495,11 @@ def normalize_response_preferences(value):
     appearance = dict(DEFAULT_RESPONSE_PREFERENCES["appearance"])
     if isinstance(appearance_source, dict):
         allowed = {
+            "color_theme": {
+                "classic", "mint", "peach", "lavender", "sky", "cream",
+                "blush", "graphite", "crimson", "royal", "forest", "ocean",
+                "aurora", "sunset", "plum", "midnight", "sand", "steel",
+            },
             "accent": {"blue", "indigo", "violet", "rose", "orange", "emerald", "cyan", "mono"},
             "gradient": {"solid", "ocean", "aurora", "sunset", "berry", "midnight"},
             "atmosphere": {"none", "glow", "mesh", "dusk"},
@@ -546,6 +560,66 @@ def journal_content():
     except Exception:
         app.logger.exception("Could not read journal content")
     return normalize_journal_content(DEFAULT_JOURNAL_CONTENT)
+
+
+def app_setting_value(key, default):
+    try:
+        rows = supabase_request(
+            "GET",
+            "app_settings",
+            params={"select": "value", "key": f"eq.{key}", "limit": "1"},
+        ) or []
+        return rows[0].get("value") if rows else default
+    except Exception:
+        app.logger.exception("Could not read app setting %s", key)
+        return default
+
+
+def save_app_setting(key, value, user_id):
+    supabase_request(
+        "POST",
+        "app_settings",
+        params={"on_conflict": "key"},
+        body={
+            "key": key,
+            "value": value,
+            "updated_by": user_id,
+            "updated_at": utc_now(),
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
+def journal_audit():
+    value = app_setting_value("journal_audit", {"events": []})
+    events = value.get("events") if isinstance(value, dict) else []
+    return events if isinstance(events, list) else []
+
+
+def record_journal_event(action, details=None):
+    events = journal_audit()
+    events.insert(
+        0,
+        {
+            "id": str(uuid.uuid4()),
+            "action": str(action)[:80],
+            "details": str(details or "")[:300],
+            "actor_email": user_email(g.user),
+            "actor_id": g.user_id,
+            "created_at": utc_now(),
+        },
+    )
+    save_app_setting("journal_audit", {"events": events[:100]}, g.user_id)
+
+
+def workshop_releases():
+    value = app_setting_value("workshop_releases", {"items": []})
+    items = value.get("items") if isinstance(value, dict) else []
+    return items if isinstance(items, list) else []
+
+
+def save_workshop_releases(items):
+    save_app_setting("workshop_releases", {"items": items[:100]}, g.user_id)
 
 
 def response_preference_prompt(value):
@@ -639,7 +713,7 @@ def add_security_headers(response):
             "Authorization, Content-Type, X-Idempotency-Key"
         )
         response.headers["Access-Control-Allow-Methods"] = (
-            "GET, POST, PATCH, DELETE, OPTIONS"
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS"
         )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -653,6 +727,7 @@ def add_security_headers(response):
             "/v1/credits",
             "/v1/profile",
             "/v1/team-mode",
+            "/v1/team/",
             "/v1/api-keys",
             "/v1/api/chat",
         )
@@ -804,6 +879,61 @@ def selected_tool_configuration(tool_ids):
                 provider_tools.append(provider_tool)
                 seen_provider_types.add(provider_type)
     return provider_tools, system_parts, feature_ids
+
+
+def infer_requested_tools(user_text, has_attachments=False):
+    text = str(user_text or "").lower()
+    inferred = []
+    if any(
+        phrase in text
+        for phrase in (
+            "deep research",
+            "research this thoroughly",
+            "comprehensive research",
+            "investigate this",
+            "compare sources",
+        )
+    ):
+        inferred.append("deep_research")
+    elif any(
+        phrase in text
+        for phrase in (
+            "search the web",
+            "web search",
+            "look this up",
+            "latest news",
+            "current information",
+            "find online",
+            "browse the web",
+        )
+    ):
+        inferred.append("web_search")
+    if any(
+        phrase in text
+        for phrase in (
+            "analyze this data",
+            "data analysis",
+            "analyze the csv",
+            "analyze the dataset",
+            "run the numbers",
+            "calculate from this file",
+        )
+    ):
+        inferred.append("data_analysis")
+    if any(
+        phrase in text
+        for phrase in (
+            "generate an image",
+            "create an image",
+            "make an image",
+            "draw an image",
+            "design an illustration",
+        )
+    ):
+        inferred.append("image_generation")
+    if has_attachments:
+        inferred.append("file_analysis")
+    return list(dict.fromkeys(inferred))
 
 
 _SAFE_BINARY_OPERATORS = {
@@ -1263,6 +1393,17 @@ def admin_required(handler):
     return wrapped
 
 
+def team_required(handler):
+    @wraps(handler)
+    @auth_required
+    def wrapped(*args, **kwargs):
+        if not is_team(g.user):
+            return api_error(403, "team_required", "Vurenn team access required.")
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
 def api_key_required(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
@@ -1580,19 +1721,81 @@ def admin_journal():
     if request.method == "GET":
         return jsonify(journal_content())
     content = normalize_journal_content(request.get_json(silent=True) or {})
-    supabase_request(
-        "POST",
-        "app_settings",
-        params={"on_conflict": "key"},
-        body={
-            "key": "journal_content",
-            "value": content,
-            "updated_by": g.user_id,
-            "updated_at": utc_now(),
-        },
-        prefer="resolution=merge-duplicates,return=minimal",
-    )
+    save_app_setting("journal_content", content, g.user_id)
+    record_journal_event("published_journal", "Published from CEO Admin")
     return jsonify(content)
+
+
+@app.route("/v1/team/journal", methods=["GET", "PUT", "OPTIONS"])
+@team_required
+def team_journal():
+    if request.method == "GET":
+        return jsonify(journal_content())
+    content = normalize_journal_content(request.get_json(silent=True) or {})
+    save_app_setting("journal_content", content, g.user_id)
+    record_journal_event("published_journal", "Published from Team Journal Editor")
+    return jsonify(content)
+
+
+@app.route("/v1/admin/journal/audit", methods=["GET", "OPTIONS"])
+@admin_required
+def admin_journal_audit():
+    return jsonify({"events": journal_audit()})
+
+
+@app.route("/v1/team/workshop", methods=["GET", "POST", "OPTIONS"])
+@team_required
+def team_workshop():
+    items = workshop_releases()
+    if request.method == "GET":
+        return jsonify({"items": items, "admin": is_admin(g.user)})
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title") or "").strip()[:120]
+    summary = str(payload.get("summary") or "").strip()[:600]
+    category = str(payload.get("category") or "Product").strip()[:40]
+    if not title or not summary:
+        return api_error(
+            422,
+            "invalid_workshop_update",
+            "A title and summary are required.",
+        )
+    item = {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "summary": summary,
+        "category": category,
+        "status": "ready_for_review",
+        "submitted_by": user_email(g.user),
+        "submitted_at": utc_now(),
+        "released_by": None,
+        "released_at": None,
+    }
+    items.insert(0, item)
+    save_workshop_releases(items)
+    record_journal_event("submitted_workshop_update", title)
+    return jsonify(item), 201
+
+
+@app.route(
+    "/v1/admin/workshop/<release_id>/publish",
+    methods=["PUT", "OPTIONS"],
+)
+@admin_required
+def publish_workshop_release(release_id):
+    items = workshop_releases()
+    selected = None
+    for item in items:
+        if str(item.get("id")) == release_id:
+            item["status"] = "released"
+            item["released_by"] = user_email(g.user)
+            item["released_at"] = utc_now()
+            selected = item
+            break
+    if not selected:
+        return api_error(404, "workshop_update_not_found", "Workshop update not found.")
+    save_workshop_releases(items)
+    record_journal_event("released_workshop_update", selected.get("title"))
+    return jsonify(selected)
 
 
 @app.route("/v1/admin/construction-mode", methods=["PUT", "OPTIONS"])
@@ -1791,7 +1994,8 @@ def revoke_api_key(key_id):
 def voice_config():
     return jsonify(
         {
-            "available": True,
+            "available": VOICE_ENABLED,
+            "status": "available" if VOICE_ENABLED else "coming_soon",
             "transport": "server-neural",
             "speech_recognition": "web-speech-api",
             "speech_synthesis": "vurenn-neural",
@@ -1817,6 +2021,13 @@ def voice_config():
 @app.route("/v1/voice/synthesize", methods=["POST", "OPTIONS"])
 @auth_required
 def voice_synthesize():
+    if not VOICE_ENABLED:
+        return api_error(
+            503,
+            "voice_coming_soon",
+            "Vurenn Voice is coming soon.",
+            retryable=False,
+        )
     if construction_mode_enabled() and not can_bypass_maintenance(g.user):
         return api_error(
             503,
@@ -2144,7 +2355,16 @@ def chat_stream():
         or any(str(tool_id) not in TOOL_CATALOG for tool_id in requested_tools)
     ):
         return api_error(422, "invalid_tools", "One or more selected tools are unavailable.")
-    requested_tools = list(dict.fromkeys(str(tool_id) for tool_id in requested_tools))
+    attachment_metadata = payload.get("attachments") or []
+    requested_tools = list(
+        dict.fromkeys(
+            [str(tool_id) for tool_id in requested_tools]
+            + infer_requested_tools(
+                user_text,
+                has_attachments=bool(attachment_metadata),
+            )
+        )
+    )
     provider_tools, tool_system_parts, tool_feature_ids = (
         selected_tool_configuration(requested_tools)
     )
@@ -2162,6 +2382,12 @@ def chat_stream():
             503,
             "under_construction",
             "Vurenn is under construction and not open to the public yet.",
+        )
+    if voice_mode and not VOICE_ENABLED:
+        return api_error(
+            503,
+            "voice_coming_soon",
+            "Vurenn Voice is coming soon.",
         )
     if not conversation_id or not user_text:
         return api_error(
@@ -2224,7 +2450,7 @@ def chat_stream():
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
     now = utc_now()
-    attachments = payload.get("attachments") or []
+    attachments = attachment_metadata
     if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
         return api_error(
             422,
@@ -2429,6 +2655,14 @@ def chat_stream():
         "not the user's balance. State uncertainty plainly. Never claim "
         "actions or sources you did not actually use. Use the saved user "
         "context naturally when helpful; do not repeat it unnecessarily. "
+        "You understand the Vurenn interface. It includes Fast, Balanced, "
+        "and Max response modes plus Web Search, Deep Research, File "
+        "Analysis, Data Analysis, and Image Generation tools. Vurenn can "
+        "select an appropriate tool automatically when the user's request "
+        "clearly requires it, so do not incorrectly tell the user that these "
+        "controls or tools do not exist. Voice is currently marked Coming "
+        "Soon. Describe only tools that were actually enabled for this "
+        "request, and never pretend a tool ran when it did not. "
         f"{SAFETY_PROMPT} {model['style']} "
         f"{response_preference_prompt(profile.get('response_preferences'))} "
         + " ".join(tool_system_parts + user_context)
