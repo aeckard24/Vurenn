@@ -2434,12 +2434,63 @@ ALLOWED_FILE_TYPES = {
     "application/pdf",
     "text/plain",
     "text/csv",
+    "text/markdown",
+    "text/html",
+    "text/xml",
+    "text/yaml",
+    "application/xml",
+    "application/rtf",
     "application/json",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "application/vnd.ms-excel",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "image/jpeg",
     "image/png",
     "image/webp",
 }
+CODE_EXECUTION_FILE_TYPES = {
+    "text/csv",
+    "application/json",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
+    "application/vnd.ms-excel",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+FILE_TYPE_BY_EXTENSION = {
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroenabled.12",
+    ".xls": "application/vnd.ms-excel",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".md": "text/markdown",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".xml": "application/xml",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+    ".rtf": "application/rtf",
+}
 MAX_FILE_BYTES = 25 * 1024 * 1024
+
+
+def is_code_execution_attachment(metadata):
+    if not isinstance(metadata, dict):
+        return False
+    mime_type = str(metadata.get("mime_type") or "").lower()
+    extension = Path(str(metadata.get("name") or "")).suffix.lower()
+    inferred_type = FILE_TYPE_BY_EXTENSION.get(extension)
+    return (
+        mime_type in CODE_EXECUTION_FILE_TYPES
+        or inferred_type in CODE_EXECUTION_FILE_TYPES
+    )
 
 
 def get_owned_uploaded_file(file_id, user_id):
@@ -2467,6 +2518,11 @@ def upload_file():
     if not uploaded or not uploaded.filename:
         return api_error(422, "file_required", "Choose a file to upload.")
     mime_type = str(uploaded.mimetype or "application/octet-stream").lower()
+    if mime_type == "application/octet-stream":
+        mime_type = FILE_TYPE_BY_EXTENSION.get(
+            Path(uploaded.filename).suffix.lower(),
+            mime_type,
+        )
     if mime_type not in ALLOWED_FILE_TYPES:
         return api_error(415, "unsupported_file_type", "That file type is not supported.")
     data = uploaded.read(MAX_FILE_BYTES + 1)
@@ -2675,6 +2731,9 @@ def chat_stream():
     ):
         return api_error(422, "invalid_tools", "One or more selected tools are unavailable.")
     attachment_metadata = payload.get("attachments") or []
+    has_code_execution_attachment = any(
+        is_code_execution_attachment(item) for item in attachment_metadata
+    )
     requested_tools = list(
         dict.fromkeys(
             [str(tool_id) for tool_id in requested_tools]
@@ -2682,6 +2741,7 @@ def chat_stream():
                 user_text,
                 has_attachments=bool(attachment_metadata),
             )
+            + (["data_analysis"] if has_code_execution_attachment else [])
         )
     )
     provider_tools, tool_system_parts, tool_feature_ids = (
@@ -2928,7 +2988,7 @@ def chat_stream():
                     "source": {"type": "file", "file_id": attachment["id"]},
                 }
             )
-        elif attachment["mime_type"] in {"text/csv", "application/json"} and (
+        elif attachment["mime_type"] in CODE_EXECUTION_FILE_TYPES and (
             "data_analysis" in requested_tools
         ):
             current_content.append(

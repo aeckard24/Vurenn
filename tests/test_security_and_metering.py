@@ -44,6 +44,20 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("code_execution_20260521", provider_types)
         self.assertIn("deep_research", feature_ids)
 
+    def test_excel_workbooks_are_routed_to_sandboxed_analysis(self):
+        excel_type = (
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        )
+        self.assertIn(excel_type, wsgi.ALLOWED_FILE_TYPES)
+        self.assertIn(excel_type, wsgi.CODE_EXECUTION_FILE_TYPES)
+        self.assertEqual(wsgi.FILE_TYPE_BY_EXTENSION[".xlsx"], excel_type)
+        self.assertTrue(
+            wsgi.is_code_execution_attachment(
+                {"name": "Book 4.xlsx", "mime_type": excel_type}
+            )
+        )
+
     def test_tools_are_inferred_from_natural_requests(self):
         self.assertEqual(
             wsgi.infer_requested_tools("Please search the web for current information"),
