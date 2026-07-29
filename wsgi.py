@@ -885,6 +885,17 @@ def selected_tool_configuration(tool_ids):
 def infer_requested_tools(user_text, has_attachments=False):
     text = str(user_text or "").lower()
     inferred = []
+    contains_web_link = bool(re.search(r"https?://[^\s]+", text))
+    contains_spreadsheet_link = contains_web_link and any(
+        marker in text
+        for marker in (
+            "sharepoint.com",
+            "docs.google.com/spreadsheets",
+            ".xlsx",
+            ".xls",
+            ".csv",
+        )
+    )
     if any(
         phrase in text
         for phrase in (
@@ -896,7 +907,7 @@ def infer_requested_tools(user_text, has_attachments=False):
         )
     ):
         inferred.append("deep_research")
-    elif any(
+    elif contains_web_link or any(
         phrase in text
         for phrase in (
             "search the web",
@@ -913,9 +924,13 @@ def infer_requested_tools(user_text, has_attachments=False):
         )
     ):
         inferred.append("web_search")
-    if any(
+    if contains_spreadsheet_link or any(
         phrase in text
         for phrase in (
+            "analyze this spreadsheet",
+            "analyse this spreadsheet",
+            "analyze the spreadsheet",
+            "analyse the spreadsheet",
             "analyze this data",
             "data analysis",
             "analyze the csv",
@@ -2997,7 +3012,11 @@ def chat_stream():
         "clearly requires it, so do not incorrectly tell the user that these "
         "controls or tools do not exist. Voice is currently marked Coming "
         "Soon. Describe only tools that were actually enabled for this "
-        "request, and never pretend a tool ran when it did not. "
+        "request, and never pretend a tool ran when it did not. When Web "
+        "Search is enabled, never claim that Vurenn has no internet access. "
+        "If one particular URL is private, expired, or blocks automated "
+        "access, explain that the specific link could not be opened and ask "
+        "for a public sharing link or uploaded file instead. "
         f"{SAFETY_PROMPT} {model['style']} "
         f"{response_preference_prompt(profile.get('response_preferences'))} "
         + " ".join(tool_system_parts + user_context)

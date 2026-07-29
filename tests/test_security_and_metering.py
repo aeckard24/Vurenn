@@ -57,6 +57,17 @@ class SecurityAndMeteringTests(unittest.TestCase):
             wsgi.infer_requested_tools("Explain this", has_attachments=True),
             ["file_analysis"],
         )
+        self.assertEqual(
+            wsgi.infer_requested_tools("Summarize https://example.com/report"),
+            ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools(
+                "Analyze this spreadsheet "
+                "https://tenant.sharepoint.com/shared/workbook"
+            ),
+            ["web_search", "data_analysis"],
+        )
 
     def test_only_approved_email_is_a_team_member(self):
         approved = next(iter(wsgi.TEAM_EMAILS))
