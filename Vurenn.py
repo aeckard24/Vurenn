@@ -79,7 +79,7 @@ except ImportError:
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID",     "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
@@ -101,10 +101,10 @@ PASSPHRASE_HASH_PATH = "delta_passphrase.hash"
 authenticated_until = 0.0
 
 # ── Stripe subscription config ────────────────────────────────────────────
-STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "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")
-STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "pk_live_51Tv6UmCAs6UWVTMh3ROD6TpuN8Oz3imEUUpt7A1QU9Kl31Ls50ioTBhEX7UaxxqZOB4ucogikZoyZgHp4DW8XNv000ysvlxeCV")  # pk_...  safe for frontend
-STRIPE_PRICE_ID        = os.environ.get("STRIPE_PRICE_ID", "price_1TvJTvCAs6UWVTMhS4S0s5H7")         # price_...  (NOT prod_...)
-STRIPE_WEBHOOK_SECRET  = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_55e5405179016c4fc35cb11a45c36c95b54930be37630e7e69d090e298d49e03")   # whsec_...
+STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")  # pk_... is safe for frontend
+STRIPE_PRICE_ID        = os.environ.get("STRIPE_PRICE_ID", "")         # price_... (NOT prod_...)
+STRIPE_WEBHOOK_SECRET  = os.environ.get("STRIPE_WEBHOOK_SECRET", "")   # whsec_...
 YOUR_DOMAIN             = os.environ.get("YOUR_DOMAIN", "http://localhost:5000")
 SUBSCRIPTION_STATUS_PATH = "subscription_status.json"
 REQUIRE_SUBSCRIPTION = True   # gate voice commands behind an active subscription
@@ -1525,5 +1525,6 @@ if __name__ == "__main__":
     init_spotify()
     start_audio_cleanup_loop()
 
-    print("[Vurenn] Starting server at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"[Vurenn] Starting server on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
