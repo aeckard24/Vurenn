@@ -51,6 +51,16 @@ class SecurityAndMeteringTests(unittest.TestCase):
     def test_voice_does_not_add_a_separate_credit_charge(self):
         self.assertEqual(wsgi.USAGE_COSTS["voice_turn"]["credits"], 0)
 
+    def test_voice_text_removes_emoji_and_markdown(self):
+        self.assertEqual(
+            wsgi.sanitize_voice_text("**Great** 😊 Let’s go 🚀"),
+            "Great  Let’s go ",
+        )
+        self.assertEqual(
+            wsgi.clean_spoken_text("Hello 👋 **No emoji aloud.**"),
+            "Hello No emoji aloud.",
+        )
+
     def test_local_arithmetic_uses_restricted_evaluator(self):
         self.assertEqual(
             wsgi.local_utility_response("calculate 2 + 2"),

@@ -820,6 +820,20 @@ def sanitize_assistant_text(value):
     return value
 
 
+_VOICE_SYMBOLS = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\uFE0E\uFE0F\u200D"
+    "]+"
+)
+
+
+def sanitize_voice_text(value):
+    value = _VOICE_SYMBOLS.sub("", str(value or ""))
+    return re.sub(r"[*_~`>|#]", "", value)
+
+
 def chat_rate_limited(user_id):
     now = time.monotonic()
     with _rate_limit_lock:
@@ -857,6 +871,7 @@ def clean_spoken_text(value):
     value = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", value)
     value = re.sub(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+", "", value)
     value = re.sub(r"[*_~`>|]", "", value)
+    value = _VOICE_SYMBOLS.sub(" ", value)
     return re.sub(r"\s+", " ", value).strip()[:TTS_MAX_CHARS]
 
 
@@ -2196,11 +2211,17 @@ def chat_stream():
     )
     if voice_mode:
         system_prompt += (
-            " This reply will be spoken aloud. Sound warm, natural, and "
-            "conversational. Keep it under 900 characters unless the user "
-            "explicitly asks for a long answer. Avoid Markdown, tables, URLs, "
-            "and code blocks unless they are essential."
+            " This is a live spoken conversation. Reply like a thoughtful "
+            "person talking naturally: one or two short sentences, usually "
+            "under 45 words. Give the direct answer first and only add detail "
+            "when the user asks for it. Do not use emoji, emoticons, Markdown, "
+            "lists, headings, tables, or decorative symbols. Avoid URLs and "
+            "code unless the user explicitly needs them."
         )
+
+    def prepare_reply_text(value):
+        safe_value = sanitize_assistant_text(value)
+        return sanitize_voice_text(safe_value) if voice_mode else safe_value
 
     def stream():
         full_text = []
@@ -2210,7 +2231,7 @@ def chat_stream():
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
             if local_answer is not None:
-                safe_text = sanitize_assistant_text(local_answer)
+                safe_text = prepare_reply_text(local_answer)
                 full_text.append(safe_text)
                 yield sse("token", {"text": safe_text})
                 usage_data = {}
@@ -2242,7 +2263,7 @@ def chat_stream():
                     )
                     if block_data.get("type") != "text":
                         continue
-                    safe_text = sanitize_assistant_text(
+                    safe_text = prepare_reply_text(
                         str(block_data.get("text") or "")
                     )
                     if safe_text:
@@ -2289,7 +2310,7 @@ def chat_stream():
                         else:
                             cutoff = -1
                         if cutoff >= 0:
-                            safe_text = sanitize_assistant_text(
+                            safe_text = prepare_reply_text(
                                 pending_text[: cutoff + 1]
                             )
                             pending_text = pending_text[cutoff + 1 :]
@@ -2297,7 +2318,7 @@ def chat_stream():
                             yield sse("token", {"text": safe_text})
                     final = response_stream.get_final_message()
                     if pending_text:
-                        safe_text = sanitize_assistant_text(pending_text)
+                        safe_text = prepare_reply_text(pending_text)
                         full_text.append(safe_text)
                         yield sse("token", {"text": safe_text})
             if local_answer is None:
