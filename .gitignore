@@ -7,3 +7,4 @@ delta_known_faces.pkl
 delta_passphrase.hash
 subscription_status.json
 voice_config.json
+tts_models/

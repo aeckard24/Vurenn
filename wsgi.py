@@ -1,15 +1,19 @@
 """Production HTTP API for the Vurenn web frontend."""
 
+import io
 import json
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
+import wave
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 
 import requests
 import stripe
@@ -86,6 +90,34 @@ MAX_ATTACHMENTS = int(os.environ.get("MAX_ATTACHMENTS", "5"))
 CHAT_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("CHAT_RATE_LIMIT_PER_MINUTE", "20")
 )
+TTS_RATE_LIMIT_PER_MINUTE = int(
+    os.environ.get("TTS_RATE_LIMIT_PER_MINUTE", "10")
+)
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "2200"))
+TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.02"))
+TTS_MODEL_DIR = Path(
+    os.environ.get(
+        "TTS_MODEL_DIR",
+        str(Path(tempfile.gettempdir()) / "vurenn-tts"),
+    )
+)
+TTS_MODEL_PATH = TTS_MODEL_DIR / "kokoro-v1.0.int8.onnx"
+TTS_VOICES_PATH = TTS_MODEL_DIR / "voices-v1.0.bin"
+TTS_MODEL_URL = os.environ.get(
+    "TTS_MODEL_URL",
+    (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+        "model-files-v1.0/kokoro-v1.0.int8.onnx"
+    ),
+)
+TTS_VOICES_URL = os.environ.get(
+    "TTS_VOICES_URL",
+    (
+        "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+        "model-files-v1.0/voices-v1.0.bin"
+    ),
+)
 
 MODEL_CATALOG = {
     "vurenn-fast": {
@@ -130,6 +162,10 @@ MODEL_CATALOG = {
 PLAN_RANK = {"free": 0, "pro": 1, "premier": 2}
 _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
+_tts_requests = defaultdict(deque)
+_tts_engine = None
+_tts_engine_lock = threading.Lock()
+_tts_synthesis_lock = threading.Lock()
 
 anthropic_client = (
     Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -495,6 +531,98 @@ def chat_rate_limited(user_id):
             return True
         bucket.append(now)
     return False
+
+
+def tts_rate_limited(user_id):
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _tts_requests[user_id]
+        while bucket and now - bucket[0] >= 60:
+            bucket.popleft()
+        if len(bucket) >= TTS_RATE_LIMIT_PER_MINUTE:
+            return True
+        bucket.append(now)
+    return False
+
+
+def clean_spoken_text(value):
+    value = str(value or "")
+    value = re.sub(
+        r"```[\s\S]*?```",
+        " Code example omitted from the spoken reply. ",
+        value,
+    )
+    value = re.sub(r"!\[[^\]]*]\([^)]*\)", " ", value)
+    value = re.sub(r"\[([^\]]+)]\([^)]*\)", r"\1", value)
+    value = re.sub(r"https?://\S+", " link ", value)
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", value)
+    value = re.sub(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+", "", value)
+    value = re.sub(r"[*_~`>|]", "", value)
+    return re.sub(r"\s+", " ", value).strip()[:TTS_MAX_CHARS]
+
+
+def download_tts_asset(url, path, minimum_bytes):
+    if path.exists() and path.stat().st_size >= minimum_bytes:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".part")
+    with requests.get(url, stream=True, timeout=(15, 180)) as response:
+        response.raise_for_status()
+        with temporary.open("wb") as destination:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    destination.write(chunk)
+    if temporary.stat().st_size < minimum_bytes:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded voice asset is incomplete: {path.name}")
+    temporary.replace(path)
+
+
+def get_tts_engine():
+    global _tts_engine
+    if _tts_engine is not None:
+        return _tts_engine
+    with _tts_engine_lock:
+        if _tts_engine is not None:
+            return _tts_engine
+        download_tts_asset(TTS_MODEL_URL, TTS_MODEL_PATH, 80_000_000)
+        download_tts_asset(TTS_VOICES_URL, TTS_VOICES_PATH, 20_000_000)
+        from kokoro_onnx import Kokoro
+
+        _tts_engine = Kokoro(str(TTS_MODEL_PATH), str(TTS_VOICES_PATH))
+        return _tts_engine
+
+
+def synthesize_wav(text):
+    import numpy as np
+
+    engine = get_tts_engine()
+    with _tts_synthesis_lock:
+        try:
+            samples, sample_rate = engine.create(
+                text,
+                voice=TTS_VOICE,
+                speed=TTS_SPEED,
+                lang="en-us",
+            )
+        except ValueError:
+            samples, sample_rate = engine.create(
+                text,
+                voice="af_sarah",
+                speed=TTS_SPEED,
+                lang="en-us",
+            )
+    pcm = (
+        np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+        * 32767
+    ).astype("<i2")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(int(sample_rate))
+        wav.writeframes(pcm.tobytes())
+    return output.getvalue()
 
 
 def construction_mode_enabled():
@@ -1000,15 +1128,84 @@ def voice_config():
     return jsonify(
         {
             "available": True,
-            "transport": "browser",
+            "transport": "server-neural",
             "speech_recognition": "web-speech-api",
-            "speech_synthesis": "speech-synthesis-api",
+            "speech_synthesis": "vurenn-neural",
+            "fallback_synthesis": "speech-synthesis-api",
             "credit_cost": USAGE_COSTS["voice_turn"]["credits"],
             "privacy": (
-                "Audio is handled by the browser's speech service. Vurenn's "
-                "backend receives the transcript, not a stored voice recording."
+                "Speech input is transcribed by the browser. Completed Vurenn "
+                "replies are converted to audio on the Vurenn server and are "
+                "not retained as voice recordings."
             ),
         }
+    )
+
+
+@app.route("/v1/voice/synthesize", methods=["POST", "OPTIONS"])
+@auth_required
+def voice_synthesize():
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user):
+        return api_error(
+            503,
+            "under_construction",
+            "Vurenn is under construction and not open to the public yet.",
+        )
+    if tts_rate_limited(g.user_id):
+        return api_error(
+            429,
+            "voice_rate_limited",
+            "Too many voice replies were requested at once. Try again shortly.",
+            retryable=True,
+        )
+    payload = request.get_json(silent=True) or {}
+    message_id = str(payload.get("message_id") or "").strip()
+    if not message_id:
+        return api_error(
+            422,
+            "invalid_request",
+            "message_id is required.",
+            details={"fields": ["message_id"]},
+        )
+    rows = supabase_request(
+        "GET",
+        "messages",
+        params={
+            "select": "id,role,content,status",
+            "id": f"eq.{message_id}",
+            "user_id": f"eq.{g.user_id}",
+            "role": "eq.assistant",
+            "status": "eq.completed",
+            "limit": "1",
+        },
+    )
+    if not rows:
+        return api_error(
+            404,
+            "message_not_found",
+            "That completed Vurenn reply was not found.",
+        )
+    text = clean_spoken_text(rows[0].get("content"))
+    if not text:
+        return api_error(422, "empty_voice_reply", "There is no reply to speak.")
+    try:
+        audio = synthesize_wav(text)
+    except Exception:
+        app.logger.exception("Neural voice synthesis failed")
+        return api_error(
+            503,
+            "voice_unavailable",
+            "The natural Vurenn voice is warming up. Try again shortly.",
+            retryable=True,
+        )
+    return Response(
+        audio,
+        mimetype="audio/wav",
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": f'inline; filename="vurenn-{message_id}.wav"',
+            "X-Voice-Engine": "vurenn-neural",
+        },
     )
 
 
@@ -1530,6 +1727,13 @@ def chat_stream():
         f"{model['style']} "
         + " ".join(tool_system_parts + user_context)
     )
+    if voice_mode:
+        system_prompt += (
+            " This reply will be spoken aloud. Sound warm, natural, and "
+            "conversational. Keep it under 900 characters unless the user "
+            "explicitly asks for a long answer. Avoid Markdown, tables, URLs, "
+            "and code blocks unless they are essential."
+        )
 
     def stream():
         full_text = []
