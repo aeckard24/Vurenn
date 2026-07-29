@@ -325,7 +325,7 @@ TOOL_CATALOG = {
     "deep_research": {
         "feature_id": "deep_research",
         "provider_tools": [
-            {"type": "web_search_20260318", "name": "web_search", "max_uses": 8},
+            {"type": "web_search_20260318", "name": "web_search", "max_uses": 12},
             {"type": "code_execution_20260521", "name": "code_execution"},
         ],
         "system": (
