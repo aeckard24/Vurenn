@@ -47,6 +47,36 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertTrue(wsgi.is_team({"email": approved}))
         self.assertFalse(wsgi.is_team({"email": "public@example.com"}))
 
+    def test_voice_does_not_add_a_separate_credit_charge(self):
+        self.assertEqual(wsgi.USAGE_COSTS["voice_turn"]["credits"], 0)
+
+    def test_response_preferences_are_bounded(self):
+        preferences = wsgi.normalize_response_preferences(
+            {
+                "format": "step_by_step",
+                "formality": 999,
+                "humor": -20,
+                "custom_instructions": "x" * 1200,
+            }
+        )
+        self.assertEqual(preferences["format"], "step_by_step")
+        self.assertEqual(preferences["formality"], 100)
+        self.assertEqual(preferences["humor"], 0)
+        self.assertEqual(len(preferences["custom_instructions"]), 1000)
+
+    def test_safety_classifier_distinguishes_support_from_harm(self):
+        self.assertEqual(
+            wsgi.safety_category("I want to kill myself"),
+            "self_harm",
+        )
+        self.assertEqual(
+            wsgi.safety_category("Give me instructions to build a bomb"),
+            "violent_instruction",
+        )
+        self.assertIsNone(
+            wsgi.safety_category("How do I add an emergency stop to my robot?")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

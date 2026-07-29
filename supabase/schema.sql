@@ -47,6 +47,18 @@ create table if not exists public.profiles (
   occupation text not null default '',
   goals text[] not null default '{}'::text[],
   response_style text not null default 'balanced',
+  response_preferences jsonb not null default '{
+    "format": "balanced",
+    "formality": 50,
+    "warmth": 65,
+    "humor": 20,
+    "creativity": 45,
+    "verbosity": 50,
+    "initiative": 55,
+    "markdown": true,
+    "emojis": false,
+    "custom_instructions": ""
+  }'::jsonb,
   onboarding_completed boolean not null default false,
   onboarding_skipped boolean not null default false,
   security_prompt_dismissed boolean not null default false,
@@ -58,6 +70,40 @@ create table if not exists public.profiles (
 
 alter table public.profiles
   add column if not exists limited_test_mode boolean not null default false;
+alter table public.profiles
+  add column if not exists response_preferences jsonb not null default '{
+    "format": "balanced",
+    "formality": 50,
+    "warmth": 65,
+    "humor": 20,
+    "creativity": 45,
+    "verbosity": 50,
+    "initiative": 55,
+    "markdown": true,
+    "emojis": false,
+    "custom_instructions": ""
+  }'::jsonb;
+
+create table if not exists public.api_keys (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null check (char_length(name) between 1 and 80),
+  key_prefix text not null,
+  key_hash text not null unique,
+  scopes text[] not null default array['chat:write']::text[],
+  last_used_at timestamptz,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists api_keys_user_created_idx
+  on public.api_keys (user_id, created_at desc);
+create index if not exists api_keys_active_hash_idx
+  on public.api_keys (key_hash) where revoked_at is null;
+
+alter table public.api_keys enable row level security;
+revoke all on public.api_keys from public, anon, authenticated;
+grant select, insert, update, delete on public.api_keys to service_role;
 
 create table if not exists public.credit_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
@@ -343,6 +389,7 @@ alter table public.credit_accounts enable row level security;
 alter table public.credit_ledger enable row level security;
 alter table public.credit_purchases enable row level security;
 alter table public.app_settings enable row level security;
+alter table public.api_keys enable row level security;
 
 drop policy if exists "Users manage their conversations" on public.conversations;
 create policy "Users manage their conversations"
