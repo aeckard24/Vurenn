@@ -200,6 +200,7 @@ _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
 _tts_requests = defaultdict(deque)
 _tts_engine = None
+_tts_ready = False
 _tts_engine_lock = threading.Lock()
 _tts_synthesis_lock = threading.Lock()
 
@@ -925,7 +926,7 @@ def download_tts_asset(url, path, minimum_bytes):
 
 
 def get_tts_engine():
-    global _tts_engine
+    global _tts_engine, _tts_ready
     if _tts_engine is not None:
         return _tts_engine
     with _tts_engine_lock:
@@ -936,6 +937,7 @@ def get_tts_engine():
         from kokoro_onnx import Kokoro
 
         _tts_engine = Kokoro(str(TTS_MODEL_PATH), str(TTS_VOICES_PATH))
+        _tts_ready = True
         return _tts_engine
 
 
@@ -979,7 +981,7 @@ def synthesize_wav(text, voice_id=None):
 def warm_tts_engine():
     try:
         get_tts_engine()
-        app.logger.info("Vurenn neural voice is ready")
+        app.logger.warning("Vurenn neural voice is ready")
     except Exception:
         app.logger.exception("Could not warm the Vurenn neural voice")
 
@@ -1640,6 +1642,7 @@ def voice_config():
             "transport": "server-neural",
             "speech_recognition": "web-speech-api",
             "speech_synthesis": "vurenn-neural",
+            "neural_ready": _tts_ready,
             "fallback_synthesis": "speech-synthesis-api",
             "default_voice_id": (
                 TTS_VOICE if TTS_VOICE in TTS_VOICES else "af_heart"
