@@ -95,6 +95,7 @@ LOCAL_RESPONSE_CREDITS = int(
 )
 MAX_MESSAGE_CHARS = int(os.environ.get("MAX_MESSAGE_CHARS", "20000"))
 MAX_ATTACHMENTS = int(os.environ.get("MAX_ATTACHMENTS", "5"))
+PROJECT_LIMITS = {"free": 3, "pro": 50, "premier": None}
 CHAT_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("CHAT_RATE_LIMIT_PER_MINUTE", "20")
 )
@@ -905,6 +906,10 @@ def infer_requested_tools(user_text, has_attachments=False):
             "current information",
             "find online",
             "browse the web",
+            "check online",
+            "current price",
+            "latest update",
+            "what happened today",
         )
     ):
         inferred.append("web_search")
@@ -928,6 +933,12 @@ def infer_requested_tools(user_text, has_attachments=False):
             "make an image",
             "draw an image",
             "design an illustration",
+            "create a logo",
+            "design a logo",
+            "make a poster",
+            "create a banner",
+            "generate a picture",
+            "concept art",
         )
     ):
         inferred.append("image_generation")
@@ -2152,6 +2163,258 @@ def get_owned_conversation(conversation_id, user_id):
     return rows[0] if rows else None
 
 
+def get_owned_project(project_id, user_id):
+    rows = supabase_request(
+        "GET",
+        "projects",
+        params={
+            "select": "*",
+            "id": f"eq.{project_id}",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
+    ) or []
+    return rows[0] if rows else None
+
+
+def serialize_project(project, *, conversation_count=0, file_count=0):
+    return {
+        key: project.get(key)
+        for key in (
+            "id",
+            "name",
+            "description",
+            "instructions",
+            "color",
+            "created_at",
+            "updated_at",
+        )
+    } | {
+        "conversation_count": conversation_count,
+        "file_count": file_count,
+    }
+
+
+@app.route("/v1/projects", methods=["GET", "POST", "OPTIONS"])
+@auth_required
+def project_collection():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        rows = supabase_request(
+            "GET",
+            "projects",
+            params={
+                "select": "*",
+                "user_id": f"eq.{g.user_id}",
+                "order": "updated_at.desc",
+            },
+        ) or []
+        conversations = supabase_request(
+            "GET",
+            "conversations",
+            params={
+                "select": "project_id",
+                "user_id": f"eq.{g.user_id}",
+                "project_id": "not.is.null",
+            },
+        ) or []
+        files = supabase_request(
+            "GET",
+            "uploaded_files",
+            params={
+                "select": "project_id",
+                "user_id": f"eq.{g.user_id}",
+                "project_id": "not.is.null",
+            },
+        ) or []
+        conversation_counts = defaultdict(int)
+        file_counts = defaultdict(int)
+        for item in conversations:
+            conversation_counts[str(item.get("project_id"))] += 1
+        for item in files:
+            file_counts[str(item.get("project_id"))] += 1
+        return jsonify(
+            {
+                "projects": [
+                    serialize_project(
+                        item,
+                        conversation_count=conversation_counts[str(item["id"])],
+                        file_count=file_counts[str(item["id"])],
+                    )
+                    for item in rows
+                ],
+                "limit": PROJECT_LIMITS[user_plan(g.user, g.user_id)],
+            }
+        )
+
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    if not name or len(name) > 80:
+        return api_error(
+            422,
+            "invalid_project_name",
+            "Project names must be 1–80 characters.",
+        )
+    plan_id = user_plan(g.user, g.user_id)
+    limit = PROJECT_LIMITS[plan_id]
+    existing = supabase_request(
+        "GET",
+        "projects",
+        params={"select": "id", "user_id": f"eq.{g.user_id}"},
+    ) or []
+    if limit is not None and len(existing) >= limit:
+        return api_error(
+            403,
+            "project_limit_reached",
+            (
+                "Free includes 3 projects. Upgrade to Pro for up to 50."
+                if plan_id == "free"
+                else (
+                    "Pro includes up to 50 projects. Upgrade to Premier "
+                    "for unlimited projects."
+                )
+            ),
+            details={"limit": limit, "plan_id": plan_id},
+        )
+    description = str(payload.get("description") or "").strip()
+    instructions = str(payload.get("instructions") or "").strip()
+    if len(description) > 500 or len(instructions) > 6000:
+        return api_error(
+            422,
+            "project_content_too_long",
+            "Project details are too long.",
+        )
+    color = str(payload.get("color") or "blue")
+    if color not in {"blue", "violet", "emerald", "amber", "rose", "slate"}:
+        color = "blue"
+    now = utc_now()
+    created = supabase_request(
+        "POST",
+        "projects",
+        body={
+            "user_id": g.user_id,
+            "name": name,
+            "description": description,
+            "instructions": instructions,
+            "color": color,
+            "created_at": now,
+            "updated_at": now,
+        },
+        prefer="return=representation",
+    )
+    return jsonify(serialize_project(created[0])), 201
+
+
+@app.route(
+    "/v1/projects/<project_id>",
+    methods=["GET", "PATCH", "DELETE", "OPTIONS"],
+)
+@auth_required
+def project_item(project_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    project = get_owned_project(project_id, g.user_id)
+    if not project:
+        return api_error(404, "project_not_found", "Project not found.")
+    if request.method == "GET":
+        conversations = supabase_request(
+            "GET",
+            "conversations",
+            params={
+                "select": (
+                    "id,title,model_id,project_id,created_at,updated_at"
+                ),
+                "user_id": f"eq.{g.user_id}",
+                "project_id": f"eq.{project_id}",
+                "order": "updated_at.desc",
+            },
+        ) or []
+        files = supabase_request(
+            "GET",
+            "uploaded_files",
+            params={
+                "select": (
+                    "id,name,mime_type,size,project_id,created_at"
+                ),
+                "user_id": f"eq.{g.user_id}",
+                "project_id": f"eq.{project_id}",
+                "order": "created_at.desc",
+            },
+        ) or []
+        return jsonify(
+            serialize_project(
+                project,
+                conversation_count=len(conversations),
+                file_count=len(files),
+            )
+            | {"conversations": conversations, "files": files}
+        )
+    if request.method == "DELETE":
+        for table in ("conversations", "uploaded_files"):
+            supabase_request(
+                "PATCH",
+                table,
+                params={
+                    "user_id": f"eq.{g.user_id}",
+                    "project_id": f"eq.{project_id}",
+                },
+                body={"project_id": None},
+                prefer="return=minimal",
+            )
+        supabase_request(
+            "DELETE",
+            "projects",
+            params={
+                "id": f"eq.{project_id}",
+                "user_id": f"eq.{g.user_id}",
+            },
+        )
+        return "", 204
+
+    payload = request.get_json(silent=True) or {}
+    updates = {"updated_at": utc_now()}
+    if "name" in payload:
+        name = str(payload.get("name") or "").strip()
+        if not name or len(name) > 80:
+            return api_error(
+                422,
+                "invalid_project_name",
+                "Project names must be 1–80 characters.",
+            )
+        updates["name"] = name
+    for field, maximum in (("description", 500), ("instructions", 6000)):
+        if field in payload:
+            value = str(payload.get(field) or "").strip()
+            if len(value) > maximum:
+                return api_error(
+                    422,
+                    "project_content_too_long",
+                    "Project details are too long.",
+                )
+            updates[field] = value
+    if payload.get("color") in {
+        "blue",
+        "violet",
+        "emerald",
+        "amber",
+        "rose",
+        "slate",
+    }:
+        updates["color"] = payload["color"]
+    updated = supabase_request(
+        "PATCH",
+        "projects",
+        params={
+            "id": f"eq.{project_id}",
+            "user_id": f"eq.{g.user_id}",
+        },
+        body=updates,
+        prefer="return=representation",
+    )
+    return jsonify(serialize_project(updated[0]))
+
+
 ALLOWED_FILE_TYPES = {
     "application/pdf",
     "text/plain",
@@ -2169,7 +2432,7 @@ def get_owned_uploaded_file(file_id, user_id):
         "GET",
         "uploaded_files",
         params={
-            "select": "id,user_id,name,mime_type,size,created_at",
+            "select": "id,user_id,name,mime_type,size,project_id,created_at",
             "id": f"eq.{file_id}",
             "user_id": f"eq.{user_id}",
             "limit": "1",
@@ -2196,6 +2459,9 @@ def upload_file():
         return api_error(422, "empty_file", "The selected file is empty.")
     if len(data) > MAX_FILE_BYTES:
         return api_error(413, "file_too_large", "Files must be 25 MB or smaller.")
+    project_id = str(request.form.get("project_id") or "").strip() or None
+    if project_id and not get_owned_project(project_id, g.user_id):
+        return api_error(404, "project_not_found", "Project not found.")
     metadata = anthropic_client.beta.files.upload(
         file=(uploaded.filename[:240], data, mime_type),
         betas=["files-api-2025-04-14"],
@@ -2206,6 +2472,7 @@ def upload_file():
         "name": uploaded.filename[:240],
         "mime_type": mime_type,
         "size": len(data),
+        "project_id": project_id,
         "created_at": utc_now(),
     }
     supabase_request(
@@ -2285,13 +2552,16 @@ def conversation_collection():
 
     payload = request.get_json(silent=True) or {}
     conversation_id = str(payload.get("temporary_id") or uuid.uuid4())
+    project_id = str(payload.get("project_id") or "").strip() or None
+    if project_id and not get_owned_project(project_id, g.user_id):
+        return api_error(404, "project_not_found", "Project not found.")
     now = utc_now()
     row = {
         "id": conversation_id,
         "user_id": g.user_id,
         "title": str(payload.get("title") or "New conversation")[:160],
         "model_id": str(payload.get("model_id") or "vurenn"),
-        "project_id": payload.get("project_id"),
+        "project_id": project_id,
         "created_at": now,
         "updated_at": now,
     }
@@ -2505,6 +2775,24 @@ def chat_stream():
         if not owned:
             return api_error(404, "file_not_found", "An attached file was not found.")
         owned_attachments.append(owned)
+    if conversation.get("project_id"):
+        project_files = supabase_request(
+            "GET",
+            "uploaded_files",
+            params={
+                "select": (
+                    "id,user_id,name,mime_type,size,project_id,created_at"
+                ),
+                "user_id": f"eq.{g.user_id}",
+                "project_id": f"eq.{conversation['project_id']}",
+                "order": "created_at.desc",
+                "limit": str(MAX_ATTACHMENTS),
+            },
+        ) or []
+        attached_ids = {item["id"] for item in owned_attachments}
+        owned_attachments.extend(
+            item for item in project_files if item["id"] not in attached_ids
+        )
     if owned_attachments and "file_analysis" not in tool_feature_ids:
         tool_feature_ids.append("file_analysis")
     local_answer = (
@@ -2546,7 +2834,7 @@ def chat_stream():
         0 if local_answer is not None else estimated_input_tokens,
         0 if local_answer is not None else model["max_tokens"],
         history_items=0 if local_answer is not None else len(previous),
-        attachment_count=len(attachments),
+        attachment_count=len(owned_attachments),
         minimum_credits=minimum_credits,
     )
     if metered:
@@ -2657,6 +2945,19 @@ def chat_stream():
     ) or []
     profile = profile_rows[0] if profile_rows else {}
     user_context = []
+    project = (
+        get_owned_project(conversation.get("project_id"), g.user_id)
+        if conversation.get("project_id")
+        else None
+    )
+    if project:
+        user_context.append(
+            "This chat belongs to the project named "
+            f"{project['name']!r}. Project purpose: "
+            f"{project.get('description') or 'Not specified'}. "
+            "Persistent project instructions: "
+            f"{project.get('instructions') or 'None'}."
+        )
     if profile.get("display_name"):
         user_context.append(f"The user's name is {profile['display_name']}.")
     if profile.get("occupation"):
@@ -2842,7 +3143,7 @@ def chat_stream():
                 usage["input_tokens"],
                 usage["output_tokens"],
                 history_items=len(previous),
-                attachment_count=len(attachments),
+                attachment_count=len(owned_attachments),
                 minimum_credits=minimum_credits,
                 server_tool_use=usage["server_tool_use"],
             )

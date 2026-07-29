@@ -212,6 +212,30 @@ class SecurityAndMeteringTests(unittest.TestCase):
             },
         )
 
+    def test_project_limits_match_the_product_tiers(self):
+        self.assertEqual(wsgi.PROJECT_LIMITS["free"], 3)
+        self.assertEqual(wsgi.PROJECT_LIMITS["pro"], 50)
+        self.assertIsNone(wsgi.PROJECT_LIMITS["premier"])
+
+    def test_project_lookup_is_scoped_to_its_owner(self):
+        with patch.object(
+            wsgi,
+            "supabase_request",
+            return_value=[{"id": "project-1", "user_id": "user-1"}],
+        ) as database:
+            project = wsgi.get_owned_project("project-1", "user-1")
+        self.assertEqual(project["id"], "project-1")
+        database.assert_called_once_with(
+            "GET",
+            "projects",
+            params={
+                "select": "*",
+                "id": "eq.project-1",
+                "user_id": "eq.user-1",
+                "limit": "1",
+            },
+        )
+
     def test_safety_classifier_distinguishes_support_from_harm(self):
         self.assertEqual(
             wsgi.safety_category("I want to kill myself"),
