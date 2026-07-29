@@ -104,6 +104,34 @@ TTS_RATE_LIMIT_PER_MINUTE = int(
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "2200"))
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
 TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.02"))
+TTS_WARM_ON_START = os.environ.get("TTS_WARM_ON_START", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+TTS_VOICES = {
+    "af_heart": {
+        "name": "Heart",
+        "description": "Warm, clear, and conversational",
+    },
+    "af_bella": {
+        "name": "Bella",
+        "description": "Calm, polished, and expressive",
+    },
+    "af_nicole": {
+        "name": "Nicole",
+        "description": "Direct, confident, and natural",
+    },
+    "am_michael": {
+        "name": "Michael",
+        "description": "Grounded, relaxed, and steady",
+    },
+    "am_liam": {
+        "name": "Liam",
+        "description": "Friendly, modern, and energetic",
+    },
+}
 TTS_MODEL_DIR = Path(
     os.environ.get(
         "TTS_MODEL_DIR",
@@ -345,6 +373,7 @@ DEFAULT_RESPONSE_PREFERENCES = {
     "markdown": True,
     "emojis": False,
     "custom_instructions": "",
+    "voice_id": "af_heart",
 }
 
 SAFETY_PROMPT = (
@@ -389,6 +418,9 @@ def normalize_response_preferences(value):
     preferences["custom_instructions"] = str(
         source.get("custom_instructions") or ""
     ).strip()[:1000]
+    voice_id = str(source.get("voice_id") or "").strip()
+    if voice_id in TTS_VOICES:
+        preferences["voice_id"] = voice_id
     return preferences
 
 
@@ -907,15 +939,20 @@ def get_tts_engine():
         return _tts_engine
 
 
-def synthesize_wav(text):
+def synthesize_wav(text, voice_id=None):
     import numpy as np
 
     engine = get_tts_engine()
+    selected_voice = (
+        voice_id
+        if voice_id in TTS_VOICES
+        else (TTS_VOICE if TTS_VOICE in TTS_VOICES else "af_heart")
+    )
     with _tts_synthesis_lock:
         try:
             samples, sample_rate = engine.create(
                 text,
-                voice=TTS_VOICE,
+                voice=selected_voice,
                 speed=TTS_SPEED,
                 lang="en-us",
             )
@@ -937,6 +974,22 @@ def synthesize_wav(text):
         wav.setframerate(int(sample_rate))
         wav.writeframes(pcm.tobytes())
     return output.getvalue()
+
+
+def warm_tts_engine():
+    try:
+        get_tts_engine()
+        app.logger.info("Vurenn neural voice is ready")
+    except Exception:
+        app.logger.exception("Could not warm the Vurenn neural voice")
+
+
+if TTS_WARM_ON_START:
+    threading.Thread(
+        target=warm_tts_engine,
+        name="vurenn-voice-warmup",
+        daemon=True,
+    ).start()
 
 
 def construction_mode_enabled():
@@ -1588,6 +1641,13 @@ def voice_config():
             "speech_recognition": "web-speech-api",
             "speech_synthesis": "vurenn-neural",
             "fallback_synthesis": "speech-synthesis-api",
+            "default_voice_id": (
+                TTS_VOICE if TTS_VOICE in TTS_VOICES else "af_heart"
+            ),
+            "voices": [
+                {"id": voice_id, **details}
+                for voice_id, details in TTS_VOICES.items()
+            ],
             "credit_cost": USAGE_COSTS["voice_turn"]["credits"],
             "privacy": (
                 "Speech input is transcribed by the browser. Completed Vurenn "
@@ -1616,12 +1676,20 @@ def voice_synthesize():
         )
     payload = request.get_json(silent=True) or {}
     message_id = str(payload.get("message_id") or "").strip()
+    voice_id = str(payload.get("voice_id") or TTS_VOICE).strip()
     if not message_id:
         return api_error(
             422,
             "invalid_request",
             "message_id is required.",
             details={"fields": ["message_id"]},
+        )
+    if voice_id not in TTS_VOICES:
+        return api_error(
+            422,
+            "invalid_voice",
+            "That Vurenn voice is unavailable.",
+            details={"fields": ["voice_id"]},
         )
     rows = supabase_request(
         "GET",
@@ -1645,7 +1713,7 @@ def voice_synthesize():
     if not text:
         return api_error(422, "empty_voice_reply", "There is no reply to speak.")
     try:
-        audio = synthesize_wav(text)
+        audio = synthesize_wav(text, voice_id)
     except Exception:
         app.logger.exception("Neural voice synthesis failed")
         return api_error(
@@ -2243,7 +2311,11 @@ def chat_stream():
                     )
                 create_kwargs = {
                     "model": model["provider_model"],
-                    "max_tokens": model["max_tokens"],
+                    "max_tokens": (
+                        min(model["max_tokens"], 160)
+                        if voice_mode
+                        else model["max_tokens"]
+                    ),
                     "system": system_prompt,
                     "messages": model_messages,
                 }
@@ -2294,16 +2366,24 @@ def chat_stream():
             else:
                 with anthropic_client.messages.stream(
                     model=model["provider_model"],
-                    max_tokens=model["max_tokens"],
+                    max_tokens=(
+                        min(model["max_tokens"], 160)
+                        if voice_mode
+                        else model["max_tokens"]
+                    ),
                     system=system_prompt,
                     messages=model_messages,
                 ) as response_stream:
                     for text in response_stream.text_stream:
                         pending_text += text
-                        if len(pending_text) > 320:
+                        stream_chunk_size = 36 if voice_mode else 120
+                        if len(pending_text) > stream_chunk_size:
                             cutoff = max(
                                 pending_text.rfind(
-                                    char, 0, len(pending_text) - 80
+                                    char,
+                                    0,
+                                    len(pending_text)
+                                    - (12 if voice_mode else 32),
                                 )
                                 for char in (" ", "\n", "\t")
                             )

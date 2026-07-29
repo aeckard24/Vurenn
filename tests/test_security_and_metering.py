@@ -122,6 +122,16 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(preferences["humor"], 0)
         self.assertEqual(len(preferences["custom_instructions"]), 1000)
 
+    def test_response_preferences_accept_only_supported_voices(self):
+        selected = wsgi.normalize_response_preferences(
+            {"voice_id": "am_michael"}
+        )
+        invalid = wsgi.normalize_response_preferences(
+            {"voice_id": "not-a-real-voice"}
+        )
+        self.assertEqual(selected["voice_id"], "am_michael")
+        self.assertEqual(invalid["voice_id"], "af_heart")
+
     def test_safety_classifier_distinguishes_support_from_harm(self):
         self.assertEqual(
             wsgi.safety_category("I want to kill myself"),

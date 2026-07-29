@@ -57,7 +57,8 @@ create table if not exists public.profiles (
     "initiative": 55,
     "markdown": true,
     "emojis": false,
-    "custom_instructions": ""
+    "custom_instructions": "",
+    "voice_id": "af_heart"
   }'::jsonb,
   onboarding_completed boolean not null default false,
   onboarding_skipped boolean not null default false,
@@ -81,7 +82,8 @@ alter table public.profiles
     "initiative": 55,
     "markdown": true,
     "emojis": false,
-    "custom_instructions": ""
+    "custom_instructions": "",
+    "voice_id": "af_heart"
   }'::jsonb;
 
 create table if not exists public.api_keys (
