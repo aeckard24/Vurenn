@@ -132,6 +132,45 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(selected["voice_id"], "am_michael")
         self.assertEqual(invalid["voice_id"], "af_heart")
 
+    def test_appearance_preferences_are_allowlisted(self):
+        preferences = wsgi.normalize_response_preferences(
+            {
+                "appearance": {
+                    "accent": "rose",
+                    "gradient": "sunset",
+                    "atmosphere": "mesh",
+                    "bubble": "soft",
+                    "font_size": "large",
+                }
+            }
+        )
+        self.assertEqual(preferences["appearance"]["accent"], "rose")
+        self.assertEqual(preferences["appearance"]["gradient"], "sunset")
+        invalid = wsgi.normalize_response_preferences(
+            {"appearance": {"accent": "javascript:red", "gradient": "url"}}
+        )
+        self.assertEqual(invalid["appearance"]["accent"], "blue")
+        self.assertEqual(invalid["appearance"]["gradient"], "solid")
+
+    def test_journal_content_is_bounded(self):
+        content = wsgi.normalize_journal_content(
+            {
+                "intro": "x" * 1000,
+                "updates": [
+                    {
+                        "date": "Today",
+                        "category": "Product",
+                        "title": "A real update",
+                        "summary": "Useful news",
+                    }
+                ],
+                "team": [{"name": "Kendric", "role": "Founding team", "note": ""}],
+            }
+        )
+        self.assertEqual(len(content["intro"]), 600)
+        self.assertEqual(content["updates"][0]["title"], "A real update")
+        self.assertEqual(content["team"][0]["name"], "Kendric")
+
     def test_safety_classifier_distinguishes_support_from_harm(self):
         self.assertEqual(
             wsgi.safety_category("I want to kill myself"),

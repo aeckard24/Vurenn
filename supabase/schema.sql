@@ -58,7 +58,14 @@ create table if not exists public.profiles (
     "markdown": true,
     "emojis": false,
     "custom_instructions": "",
-    "voice_id": "af_heart"
+    "voice_id": "af_heart",
+    "appearance": {
+      "accent": "blue",
+      "gradient": "solid",
+      "atmosphere": "none",
+      "bubble": "rounded",
+      "font_size": "default"
+    }
   }'::jsonb,
   onboarding_completed boolean not null default false,
   onboarding_skipped boolean not null default false,
@@ -83,7 +90,14 @@ alter table public.profiles
     "markdown": true,
     "emojis": false,
     "custom_instructions": "",
-    "voice_id": "af_heart"
+    "voice_id": "af_heart",
+    "appearance": {
+      "accent": "blue",
+      "gradient": "solid",
+      "atmosphere": "none",
+      "bubble": "rounded",
+      "font_size": "default"
+    }
   }'::jsonb;
 
 create table if not exists public.api_keys (

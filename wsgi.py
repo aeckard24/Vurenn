@@ -375,6 +375,66 @@ DEFAULT_RESPONSE_PREFERENCES = {
     "emojis": False,
     "custom_instructions": "",
     "voice_id": "af_heart",
+    "appearance": {
+        "accent": "blue",
+        "gradient": "solid",
+        "atmosphere": "none",
+        "bubble": "rounded",
+        "font_size": "default",
+    },
+}
+
+DEFAULT_JOURNAL_CONTENT = {
+    "intro": (
+        "This is the public record of Vurenn's progress: product updates, "
+        "decisions, lessons, and introductions to the people doing the work."
+    ),
+    "updates": [
+        {
+            "date": "July 29, 2026",
+            "category": "Product",
+            "title": "Live voice, rebuilt",
+            "summary": (
+                "A focused conversation screen, faster turn-taking, cleaner "
+                "spoken replies, and controls that stay out of the way."
+            ),
+        },
+        {
+            "date": "July 29, 2026",
+            "category": "Developers",
+            "title": "A safer Vurenn API foundation",
+            "summary": (
+                "Authenticated access, usage tracking, and clear model behavior "
+                "for apps, tools, and future robotics work."
+            ),
+        },
+        {
+            "date": "July 2026",
+            "category": "Company",
+            "title": "Preparing Vurenn for launch",
+            "summary": (
+                "Connecting the core product, tightening billing and security, "
+                "and testing every path before opening the doors."
+            ),
+        },
+    ],
+    "team": [
+        {
+            "name": "Noah Steiner",
+            "role": "CEO · Frontend developer · Treasurer",
+            "note": "Product direction, company strategy, frontend development, and financial oversight.",
+        },
+        {
+            "name": "Andrew",
+            "role": "Coder",
+            "note": "Backend engineering, infrastructure, and the systems that power Vurenn.",
+        },
+        {
+            "name": "Kendric",
+            "role": "Founding team",
+            "note": "Early product testing, practical feedback, and helping shape the product.",
+        },
+    ],
 }
 
 SAFETY_PROMPT = (
@@ -422,7 +482,70 @@ def normalize_response_preferences(value):
     voice_id = str(source.get("voice_id") or "").strip()
     if voice_id in TTS_VOICES:
         preferences["voice_id"] = voice_id
+    appearance_source = source.get("appearance")
+    appearance = dict(DEFAULT_RESPONSE_PREFERENCES["appearance"])
+    if isinstance(appearance_source, dict):
+        allowed = {
+            "accent": {"blue", "indigo", "violet", "rose", "orange", "emerald", "cyan", "mono"},
+            "gradient": {"solid", "ocean", "aurora", "sunset", "berry", "midnight"},
+            "atmosphere": {"none", "glow", "mesh", "dusk"},
+            "bubble": {"rounded", "soft", "compact"},
+            "font_size": {"small", "default", "large"},
+        }
+        for key, choices in allowed.items():
+            if appearance_source.get(key) in choices:
+                appearance[key] = appearance_source[key]
+    preferences["appearance"] = appearance
     return preferences
+
+
+def normalize_journal_content(value):
+    source = value if isinstance(value, dict) else {}
+    intro = str(source.get("intro") or DEFAULT_JOURNAL_CONTENT["intro"]).strip()[:600]
+
+    def normalize_rows(key, fields, limit):
+        rows = source.get(key)
+        if not isinstance(rows, list):
+            return [dict(item) for item in DEFAULT_JOURNAL_CONTENT[key]]
+        normalized = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                continue
+            item = {
+                field: str(row.get(field) or "").strip()[:maximum]
+                for field, maximum in fields.items()
+            }
+            if item.get("title") or item.get("name"):
+                normalized.append(item)
+        return normalized
+
+    return {
+        "intro": intro,
+        "updates": normalize_rows(
+            "updates",
+            {"date": 40, "category": 40, "title": 120, "summary": 500},
+            12,
+        ),
+        "team": normalize_rows(
+            "team",
+            {"name": 80, "role": 120, "note": 400},
+            12,
+        ),
+    }
+
+
+def journal_content():
+    try:
+        rows = supabase_request(
+            "GET",
+            "app_settings",
+            params={"select": "value", "key": "eq.journal_content", "limit": "1"},
+        ) or []
+        if rows:
+            return normalize_journal_content(rows[0].get("value"))
+    except Exception:
+        app.logger.exception("Could not read journal content")
+    return normalize_journal_content(DEFAULT_JOURNAL_CONTENT)
 
 
 def response_preference_prompt(value):
@@ -1238,6 +1361,11 @@ def public_config():
     )
 
 
+@app.route("/v1/public/journal", methods=["GET"])
+def public_journal():
+    return jsonify(journal_content())
+
+
 @app.route("/v1/maintenance/access", methods=["GET", "OPTIONS"])
 @auth_required
 def maintenance_access():
@@ -1446,6 +1574,27 @@ def admin_config():
     )
 
 
+@app.route("/v1/admin/journal", methods=["GET", "PUT", "OPTIONS"])
+@admin_required
+def admin_journal():
+    if request.method == "GET":
+        return jsonify(journal_content())
+    content = normalize_journal_content(request.get_json(silent=True) or {})
+    supabase_request(
+        "POST",
+        "app_settings",
+        params={"on_conflict": "key"},
+        body={
+            "key": "journal_content",
+            "value": content,
+            "updated_by": g.user_id,
+            "updated_at": utc_now(),
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    return jsonify(content)
+
+
 @app.route("/v1/admin/construction-mode", methods=["PUT", "OPTIONS"])
 @admin_required
 def update_construction_mode():
@@ -1546,6 +1695,10 @@ def profile():
         values["response_preferences"] = normalize_response_preferences(
             values["response_preferences"]
         )
+        if user_plan(g.user, g.user_id) == "free":
+            values["response_preferences"]["appearance"] = dict(
+                DEFAULT_RESPONSE_PREFERENCES["appearance"]
+            )
     values["updated_at"] = utc_now()
     updated = supabase_request(
         "PATCH",
