@@ -1,0 +1,55 @@
+"""
+Tests for the Vurenn FastAPI backend. These avoid requiring a real
+ANTHROPIC_API_KEY by testing endpoints that don't call Claude, plus a chat
+message handled entirely by a local fast-path handler (math).
+
+Run with: pytest
+"""
+
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health_returns_ok():
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["provider"] == "anthropic"
+    assert "provider_configured" in data
+
+
+def test_models_lists_vurenn_default():
+    response = client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["models"]) >= 1
+    assert data["models"][0]["id"] == "vurenn-default"
+    assert data["models"][0]["provider"] == "anthropic"
+
+
+def test_chat_stream_math_handled_locally():
+    response = client.post("/v1/chat/stream", json={"message": "what is 2 + 2"})
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    body = response.text
+    assert 'data: {"type": "token"' in body
+    assert '"content": "4"' in body
+    assert 'data: {"type": "done"}' in body
+
+
+def test_chat_stream_time_handled_locally():
+    response = client.post("/v1/chat/stream", json={"message": "what time is it"})
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "token"' in body
+    assert "It's" in body
+    assert '"type": "done"' in body
+
+
+def test_chat_stream_requires_message_field():
+    response = client.post("/v1/chat/stream", json={})
+    assert response.status_code == 422
