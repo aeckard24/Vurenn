@@ -1,4 +1,8 @@
-"""Production HTTP API for the Vurenn web frontend."""
+"""Security-audit sandbox.
+
+This branch intentionally cannot connect to Vurenn production services.
+Production configuration and deployment descriptors are excluded.
+"""
 
 import ast
 import io
@@ -28,6 +32,7 @@ from stripe._error import SignatureVerificationError
 
 
 app = Flask(__name__)
+AUDIT_SANDBOX_BUILD = True
 app.config["MAX_CONTENT_LENGTH"] = int(
     os.environ.get("MAX_REQUEST_BYTES", str(26 * 1024 * 1024))
 )
@@ -66,7 +71,7 @@ FRONTEND_ORIGINS = {
 ADMIN_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
-        "ADMIN_EMAILS", "noahssteiner@icloud.com"
+        "ADMIN_EMAILS", "audit-admin@example.invalid"
     ).split(",")
     if value.strip()
 }
@@ -74,11 +79,30 @@ MAINTENANCE_BYPASS_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
         "MAINTENANCE_BYPASS_EMAILS",
-        os.environ.get("ADMIN_EMAILS", "noahssteiner@icloud.com"),
+        os.environ.get("ADMIN_EMAILS", "audit-admin@example.invalid"),
     ).split(",")
     if value.strip()
 }
 TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS
+
+if AUDIT_SANDBOX_BUILD:
+    # Hard-coded isolation for the audit branch. Environment variables cannot
+    # re-enable privileged services accidentally.
+    SUPABASE_URL = ""
+    SUPABASE_SERVICE_ROLE_KEY = ""
+    ANTHROPIC_API_KEY = ""
+    STRIPE_SECRET_KEY = ""
+    STRIPE_PRICE_ID = ""
+    STRIPE_WEBHOOK_SECRET = ""
+    STRIPE_PRICES = {key: "" for key in STRIPE_PRICES}
+    FRONTEND_URL = "http://127.0.0.1:3000"
+    FRONTEND_ORIGINS = {FRONTEND_URL}
+    ADMIN_EMAILS = {"audit-admin@example.invalid"}
+    MAINTENANCE_BYPASS_EMAILS = {
+        "audit-admin@example.invalid",
+        "audit-team@example.invalid",
+    }
+    TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS
 
 # Credits are deliberately a small denomination. The two top-off packs sell at
 # roughly $0.0024-$0.0026 per credit, while metering budgets only $0.001 of

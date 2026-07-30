@@ -6,6 +6,17 @@ import wsgi
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_audit_branch_cannot_use_production_integrations(self):
+        self.assertTrue(wsgi.AUDIT_SANDBOX_BUILD)
+        self.assertEqual(wsgi.SUPABASE_URL, "")
+        self.assertEqual(wsgi.SUPABASE_SERVICE_ROLE_KEY, "")
+        self.assertEqual(wsgi.ANTHROPIC_API_KEY, "")
+        self.assertEqual(wsgi.STRIPE_SECRET_KEY, "")
+        self.assertEqual(
+            wsgi.ADMIN_EMAILS,
+            {"audit-admin@example.invalid"},
+        )
+
     def test_provider_capacity_errors_use_a_fast_fallback(self):
         requested = wsgi.MODEL_CATALOG["vurenn"]["provider_model"]
         attempts = wsgi.provider_model_attempts(requested)
