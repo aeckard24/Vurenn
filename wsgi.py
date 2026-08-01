@@ -488,8 +488,8 @@ DEFAULT_JOURNAL_CONTENT = {
         },
         {
             "name": "Andrew",
-            "role": "Coder",
-            "note": "Backend engineering, infrastructure, and the systems that power Vurenn.",
+            "role": "Coder, Co-Founder",
+            "note": "Backend engineering, cybersecurity, networker, infrastructure, and the systems that power Vurenn.",
         },
         {
             "name": "Kendric",
