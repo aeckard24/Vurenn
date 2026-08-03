@@ -102,7 +102,7 @@ CHAT_RATE_LIMIT_PER_MINUTE = int(
 TTS_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("TTS_RATE_LIMIT_PER_MINUTE", "10")
 )
-VOICE_ENABLED = os.environ.get("VOICE_ENABLED", "false").lower() in {
+VOICE_ENABLED = os.environ.get("VOICE_ENABLED", "true").lower() in {
     "1",
     "true",
     "yes",
@@ -110,7 +110,7 @@ VOICE_ENABLED = os.environ.get("VOICE_ENABLED", "false").lower() in {
 }
 TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "2200"))
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_heart")
-TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.02"))
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "0.98"))
 TTS_WARM_ON_START = os.environ.get("TTS_WARM_ON_START", "false").lower() in {
     "1",
     "true",
@@ -429,12 +429,12 @@ DEFAULT_JOURNAL_CONTENT = {
     ),
     "updates": [
         {
-            "date": "July 29, 2026",
+            "date": "August 3, 2026",
             "category": "Product",
-            "title": "Voice enters quality testing",
+            "title": "Vurenn Voice returns",
             "summary": (
-                "Voice is marked Coming Soon while the team improves response "
-                "speed, turn-taking, and natural speech quality."
+                "Hands-free conversation is available with automatic listening, "
+                "short spoken replies, and five selectable neural voices."
             ),
         },
         {
