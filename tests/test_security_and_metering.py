@@ -181,6 +181,43 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(preferences["humor"], 0)
         self.assertEqual(len(preferences["custom_instructions"]), 1000)
 
+    def test_identity_prompt_is_truthful_christ_centered_and_respectful(self):
+        prompt = wsgi.CORE_IDENTITY_PROMPT
+        self.assertIn("Tell the truth plainly and consistently", prompt)
+        self.assertIn("Christ-centered", prompt)
+        self.assertIn("teachings and example of Jesus", prompt)
+        self.assertIn("never be cruel", prompt)
+        self.assertIn("Treat users of every belief with respect", prompt)
+
+    def test_tone_presets_produce_distinct_prompt_instructions(self):
+        direct = wsgi.response_preference_prompt(
+            {
+                "formality": 20,
+                "warmth": 20,
+                "humor": 10,
+                "creativity": 20,
+                "verbosity": 20,
+                "initiative": 20,
+            }
+        )
+        expressive = wsgi.response_preference_prompt(
+            {
+                "formality": 85,
+                "warmth": 90,
+                "humor": 80,
+                "creativity": 85,
+                "verbosity": 85,
+                "initiative": 85,
+            }
+        )
+        self.assertIn("casual, natural, and laid-back", direct)
+        self.assertIn("direct and emotionally restrained", direct)
+        self.assertIn("Keep answers brief", direct)
+        self.assertIn("professional and formal", expressive)
+        self.assertIn("gentle, reassuring", expressive)
+        self.assertIn("thorough context", expressive)
+        self.assertNotEqual(direct, expressive)
+
     def test_response_preferences_accept_only_supported_voices(self):
         selected = wsgi.normalize_response_preferences(
             {"voice_id": "am_michael"}
