@@ -1,6 +1,8 @@
 """Production HTTP API for the Vurenn web frontend."""
 
 import ast
+import base64
+import hmac
 import io
 import hashlib
 import json
@@ -18,7 +20,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 import stripe
@@ -41,6 +43,20 @@ ANTHROPIC_MODEL = os.environ.get(
 ANTHROPIC_PREMIUM_MODEL = os.environ.get(
     "ANTHROPIC_PREMIUM_MODEL", "claude-opus-5"
 )
+OPENAI_IMAGE_API_KEY = os.environ.get("OPENAI_IMAGE_API_KEY", "")
+OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
+OPENAI_IMAGE_QUALITY = os.environ.get("OPENAI_IMAGE_QUALITY", "medium")
+OPENAI_IMAGE_SIZE = os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
+OPENAI_IMAGE_TIMEOUT_SECONDS = int(
+    os.environ.get("OPENAI_IMAGE_TIMEOUT_SECONDS", "180")
+)
+GENERATED_IMAGE_BUCKET = os.environ.get(
+    "GENERATED_IMAGE_BUCKET", "vurenn-generated-images"
+)
+GENERATED_IMAGE_SIGNING_SECRET = os.environ.get(
+    "GENERATED_IMAGE_SIGNING_SECRET", ""
+)
+PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "").rstrip("/")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 STRIPE_PRICES = {
@@ -329,8 +345,8 @@ USAGE_COSTS = {
     "image_generation": {
         "label": "Image generation",
         "credits": 350,
-        "description": "Generate a downloadable SVG illustration",
-        "available": True,
+        "description": "Generate a high-quality downloadable image",
+        "available": bool(OPENAI_IMAGE_API_KEY),
     },
 }
 
@@ -375,11 +391,7 @@ TOOL_CATALOG = {
         "feature_id": "image_generation",
         "provider_tools": [],
         "system": (
-            "Create a polished original vector illustration matching the user's "
-            "request. Return a short description followed by exactly one fenced "
-            "```svg code block. The SVG must use viewBox='0 0 1024 1024', must "
-            "not contain scripts, foreignObject, external URLs, animation, or "
-            "event attributes, and should be visually strong at full size."
+            "Image generation is handled by Vurenn's dedicated image service."
         ),
     },
 }
@@ -840,6 +852,121 @@ def supabase_request(method, path, *, params=None, body=None, prefer=None):
     if not response.content:
         return None
     return response.json()
+
+
+def image_service_configured():
+    return bool(
+        OPENAI_IMAGE_API_KEY
+        and supabase_configured()
+        and GENERATED_IMAGE_SIGNING_SECRET
+    )
+
+
+def generated_image_token(object_path):
+    return hmac.new(
+        GENERATED_IMAGE_SIGNING_SECRET.encode("utf-8"),
+        object_path.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def ensure_generated_image_bucket():
+    response = requests.post(
+        f"{SUPABASE_URL}/storage/v1/bucket",
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "id": GENERATED_IMAGE_BUCKET,
+            "name": GENERATED_IMAGE_BUCKET,
+            "public": False,
+            "file_size_limit": 20 * 1024 * 1024,
+            "allowed_mime_types": ["image/webp"],
+        },
+        timeout=15,
+    )
+    bucket_already_exists = (
+        response.status_code == 400
+        and "exist" in response.text.lower()
+    )
+    if response.status_code not in {200, 201, 409} and not bucket_already_exists:
+        raise RuntimeError(
+            "Could not prepare private generated-image storage "
+            f"({response.status_code})."
+        )
+
+
+def store_generated_image(user_id, image_bytes):
+    ensure_generated_image_bucket()
+    object_path = f"{user_id}/{uuid.uuid4().hex}.webp"
+    response = requests.post(
+        (
+            f"{SUPABASE_URL}/storage/v1/object/"
+            f"{quote(GENERATED_IMAGE_BUCKET, safe='')}/"
+            f"{quote(object_path, safe='/')}"
+        ),
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "image/webp",
+            "x-upsert": "false",
+        },
+        data=image_bytes,
+        timeout=30,
+    )
+    if response.status_code not in {200, 201}:
+        raise RuntimeError(
+            "Could not store the generated image "
+            f"({response.status_code})."
+        )
+    token = generated_image_token(object_path)
+    api_base = PUBLIC_API_URL or request.url_root.rstrip("/")
+    return (
+        f"{api_base}/v1/generated-images/{quote(object_path, safe='/')}"
+        f"?token={token}"
+    )
+
+
+def generate_image(prompt, user_id):
+    if not image_service_configured():
+        raise RuntimeError("IMAGE_SERVICE_NOT_CONFIGURED")
+    response = requests.post(
+        "https://api.openai.com/v1/images/generations",
+        headers={
+            "Authorization": f"Bearer {OPENAI_IMAGE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_IMAGE_MODEL,
+            "prompt": prompt,
+            "size": OPENAI_IMAGE_SIZE,
+            "quality": OPENAI_IMAGE_QUALITY,
+            "output_format": "webp",
+            "n": 1,
+        },
+        timeout=(15, OPENAI_IMAGE_TIMEOUT_SECONDS),
+    )
+    if response.status_code >= 400:
+        app.logger.error(
+            "Image provider request failed (%s): %s",
+            response.status_code,
+            response.text[:300],
+        )
+        raise RuntimeError("IMAGE_PROVIDER_ERROR")
+    result = response.json()
+    images = result.get("data") or []
+    encoded = images[0].get("b64_json") if images else None
+    if not encoded:
+        raise RuntimeError("IMAGE_PROVIDER_EMPTY_RESPONSE")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE") from error
+    if not image_bytes or len(image_bytes) > 20 * 1024 * 1024:
+        raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE")
+    return store_generated_image(user_id, image_bytes)
 
 
 def update_user_plan(user_id, plan_id):
@@ -1552,6 +1679,7 @@ def health():
     checks = {
         "database": supabase_configured(),
         "assistant": anthropic_client is not None,
+        "image_generation": image_service_configured(),
         "billing": bool(
             STRIPE_SECRET_KEY
             and STRIPE_PRICES["pro_monthly"]
@@ -1564,6 +1692,44 @@ def health():
             "service": "vurenn-api",
             "checks": checks,
         }
+    )
+
+
+@app.route("/v1/generated-images/<path:object_path>", methods=["GET"])
+def generated_image(object_path):
+    supplied_token = str(request.args.get("token") or "")
+    if (
+        not GENERATED_IMAGE_SIGNING_SECRET
+        or not re.fullmatch(
+            r"[0-9a-fA-F-]{32,36}/[0-9a-f]{32}\.webp", object_path
+        )
+        or not hmac.compare_digest(
+            supplied_token,
+            generated_image_token(object_path),
+        )
+    ):
+        return api_error(404, "image_not_found", "That image is unavailable.")
+    response = requests.get(
+        (
+            f"{SUPABASE_URL}/storage/v1/object/"
+            f"{quote(GENERATED_IMAGE_BUCKET, safe='')}/"
+            f"{quote(object_path, safe='/')}"
+        ),
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+        timeout=30,
+    )
+    if response.status_code != 200:
+        return api_error(404, "image_not_found", "That image is unavailable.")
+    return Response(
+        response.content,
+        mimetype="image/webp",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Content-Disposition": "inline",
+        },
     )
 
 
@@ -2820,6 +2986,7 @@ def chat_stream():
     provider_tools, tool_system_parts, tool_feature_ids = (
         selected_tool_configuration(requested_tools)
     )
+    image_request = "image_generation" in requested_tools
     feature_id = (
         "voice_turn"
         if voice_mode
@@ -2948,7 +3115,14 @@ def chat_stream():
         if not requested_tools and not owned_attachments
         else None
     )
-    if not anthropic_client and local_answer is None:
+    if image_request and not image_service_configured():
+        return api_error(
+            503,
+            "image_service_not_configured",
+            "Vurenn Image is being configured. Please try again shortly.",
+            retryable=True,
+        )
+    if not image_request and not anthropic_client and local_answer is None:
         return api_error(
             503,
             "assistant_not_configured",
@@ -3179,6 +3353,31 @@ def chat_stream():
                 full_text.append(safe_text)
                 yield sse("token", {"text": safe_text})
                 usage_data = {}
+            elif image_request:
+                yield sse(
+                    "tool_started",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                    },
+                )
+                image_url = generate_image(user_text, user_id)
+                safe_text = (
+                    "Here is your generated image.\n\n"
+                    f"![Generated image]({image_url})\n\n"
+                    f"[Download the full image]({image_url})"
+                )
+                full_text.append(safe_text)
+                yield sse("token", {"text": safe_text})
+                yield sse(
+                    "tool_completed",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "summary": "Image ready",
+                    },
+                )
+                usage_data = {}
             elif requested_tools or owned_attachments:
                 for tool_id in requested_tools:
                     yield sse(
@@ -3186,7 +3385,11 @@ def chat_stream():
                         {"tool_call_id": tool_id, "tool_name": tool_id},
                     )
                 create_kwargs = {
-                    "model": model["provider_model"],
+                    "model": (
+                        MODEL_CATALOG["vurenn-fast"]["provider_model"]
+                        if voice_mode
+                        else model["provider_model"]
+                    ),
                     "max_tokens": (
                         min(model["max_tokens"], 160)
                         if voice_mode
@@ -3198,9 +3401,8 @@ def chat_stream():
                 if provider_tools:
                     create_kwargs["tools"] = provider_tools
                 provider_error = None
-                for attempt, provider_model in enumerate(
-                    provider_model_attempts(model["provider_model"])
-                ):
+                attempt_models = provider_model_attempts(create_kwargs["model"])
+                for attempt, provider_model in enumerate(attempt_models):
                     create_kwargs["model"] = provider_model
                     try:
                         if owned_attachments:
@@ -3218,13 +3420,7 @@ def chat_stream():
                         provider_error = error
                         if (
                             not is_provider_capacity_error(error)
-                            or attempt
-                            == len(
-                                provider_model_attempts(
-                                    model["provider_model"]
-                                )
-                            )
-                            - 1
+                            or attempt == len(attempt_models) - 1
                         ):
                             raise
                         app.logger.warning(
@@ -3272,7 +3468,9 @@ def chat_stream():
             else:
                 provider_error = None
                 attempt_models = provider_model_attempts(
-                    model["provider_model"]
+                    MODEL_CATALOG["vurenn-fast"]["provider_model"]
+                    if voice_mode
+                    else model["provider_model"]
                 )
                 for attempt, provider_model in enumerate(attempt_models):
                     try:
@@ -3336,7 +3534,7 @@ def chat_stream():
                         time.sleep(0.75)
                 if provider_error is not None:
                     raise provider_error
-            if local_answer is None:
+            if local_answer is None and not image_request:
                 usage_data = (
                     final.usage.model_dump()
                     if hasattr(final.usage, "model_dump")
@@ -3420,14 +3618,22 @@ def chat_stream():
                 "error",
                 {
                     "code": (
-                        "provider_busy"
-                        if is_provider_capacity_error(error)
-                        else "assistant_error"
+                        "image_generation_failed"
+                        if image_request
+                        else (
+                            "provider_busy"
+                            if is_provider_capacity_error(error)
+                            else "assistant_error"
+                        )
                     ),
                     "message": (
-                        "Vurenn is temporarily busy. Please retry in a moment."
-                        if is_provider_capacity_error(error)
-                        else "Vurenn could not complete the response."
+                        "Vurenn could not finish that image. Please retry in a moment."
+                        if image_request
+                        else (
+                            "Vurenn is temporarily busy. Please retry in a moment."
+                            if is_provider_capacity_error(error)
+                            else "Vurenn could not complete the response."
+                        )
                     ),
                     "retryable": True,
                 },

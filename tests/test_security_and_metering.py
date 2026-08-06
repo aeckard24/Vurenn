@@ -1,11 +1,50 @@
 import unittest
+import base64
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import wsgi
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_generated_image_links_are_signed(self):
+        with patch.object(wsgi, "GENERATED_IMAGE_SIGNING_SECRET", "test-secret"):
+            first = wsgi.generated_image_token(
+                "11111111-1111-1111-1111-111111111111/" + "a" * 32 + ".webp"
+            )
+            second = wsgi.generated_image_token(
+                "11111111-1111-1111-1111-111111111111/" + "b" * 32 + ".webp"
+            )
+        self.assertEqual(len(first), 64)
+        self.assertNotEqual(first, second)
+
+    def test_image_generation_uses_only_the_server_image_key(self):
+        provider_response = Mock(
+            status_code=200,
+            json=lambda: {
+                "data": [
+                    {"b64_json": base64.b64encode(b"webp-bytes").decode("ascii")}
+                ]
+            },
+        )
+        with patch.object(wsgi, "OPENAI_IMAGE_API_KEY", "server-image-key"), patch.object(
+            wsgi, "GENERATED_IMAGE_SIGNING_SECRET", "test-secret"
+        ), patch.object(wsgi, "SUPABASE_URL", "https://example.supabase.co"), patch.object(
+            wsgi, "SUPABASE_SERVICE_ROLE_KEY", "service-role"
+        ), patch.object(wsgi.requests, "post", return_value=provider_response) as post, patch.object(
+            wsgi, "store_generated_image", return_value="https://api.example/image"
+        ) as store:
+            url = wsgi.generate_image("A calm mountain at dawn", "user-1")
+
+        self.assertEqual(url, "https://api.example/image")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer server-image-key",
+        )
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "gpt-image-2")
+        self.assertNotIn("server-image-key", str(post.call_args.kwargs["json"]))
+        store.assert_called_once_with("user-1", b"webp-bytes")
+
     def test_provider_capacity_errors_use_a_fast_fallback(self):
         requested = wsgi.MODEL_CATALOG["vurenn"]["provider_model"]
         attempts = wsgi.provider_model_attempts(requested)

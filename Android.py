@@ -80,7 +80,7 @@ except ImportError:
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")  # Set env var or paste key here
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CONVERSATION_TIMEOUT = 12  # seconds to wait for a follow-up before requiring Enter again
 
 # ── Spotify credentials ───────────────────────────────────────────────────────
