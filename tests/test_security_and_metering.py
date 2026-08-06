@@ -365,6 +365,19 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("never be cruel", prompt)
         self.assertIn("Treat users of every belief with respect", prompt)
 
+    def test_epistemic_standard_rejects_false_certainty(self):
+        prompt = wsgi.EPISTEMIC_STANDARD_PROMPT
+        self.assertIn("never as a guarantee", prompt)
+        self.assertIn("Do not repeat an unsupported premise as fact", prompt)
+        self.assertIn("Cite only sources actually returned by a tool", prompt)
+        self.assertIn("clearly labeled uncertainty", prompt)
+
+    def test_project_intelligence_requires_real_tool_results(self):
+        prompt = wsgi.PROJECT_INTELLIGENCE_PROMPT
+        self.assertIn("definition of done", prompt)
+        self.assertIn("map each source to the claim it supports", prompt)
+        self.assertIn("unless the corresponding tool or storage operation actually completed", prompt)
+
     def test_tone_presets_produce_distinct_prompt_instructions(self):
         direct = wsgi.response_preference_prompt(
             {
