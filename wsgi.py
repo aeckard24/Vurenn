@@ -367,19 +367,23 @@ TOOL_CATALOG = {
             {"type": "web_search_20260318", "name": "web_search", "max_uses": 3}
         ],
         "system": (
-            "Search the live web when it helps. Cite the sources you actually "
-            "used and distinguish current facts from inference."
+            "This request needs freshly verified information. You must use "
+            "web_search before answering. Cite the sources actually returned, "
+            "give the direct result first, and distinguish current facts from inference. "
+            "Never ask the user to repeat or rephrase a request merely to trigger search."
         ),
     },
     "deep_research": {
         "feature_id": "deep_research",
         "provider_tools": [
-            {"type": "web_search_20260318", "name": "web_search", "max_uses": 12},
+            {"type": "web_search_20260318", "name": "web_search", "max_uses": 20},
             {"type": "code_execution_20260521", "name": "code_execution"},
         ],
         "system": (
-            "Perform multi-step research. Search broadly, compare reliable "
-            "sources, resolve conflicts, and return a cited synthesis."
+            "Perform genuine multi-step research with the available search budget. "
+            "Search broadly, compare reliable primary sources where possible, resolve "
+            "conflicts, and return a cited synthesis. Never inflate the number of "
+            "sources checked or claim that research continued after the request ended."
         ),
     },
     "data_analysis": {
@@ -1375,6 +1379,14 @@ def selected_tool_configuration(tool_ids):
             if provider_type not in seen_provider_types:
                 provider_tools.append(provider_tool)
                 seen_provider_types.add(provider_type)
+            elif "max_uses" in provider_tool:
+                for existing in provider_tools:
+                    if existing["type"] == provider_type:
+                        existing["max_uses"] = max(
+                            int(existing.get("max_uses", 0)),
+                            int(provider_tool["max_uses"]),
+                        )
+                        break
     return provider_tools, system_parts, feature_ids
 
 
@@ -1403,7 +1415,7 @@ def infer_requested_tools(user_text, has_attachments=False):
         )
     ):
         inferred.append("deep_research")
-    elif contains_web_link or any(
+    elif contains_web_link or current_information_requires_web(text) or any(
         phrase in text
         for phrase in (
             "search the web",
@@ -1462,6 +1474,73 @@ def infer_requested_tools(user_text, has_attachments=False):
     if has_attachments:
         inferred.append("file_analysis")
     return list(dict.fromkeys(inferred))
+
+
+_ALWAYS_LIVE_PATTERNS = (
+    r"\b(?:weather|forecast|temperature|radar|air quality|uv index|snowfall|rainfall)\b",
+    r"\b(?:breaking news|latest news|news today|headlines?)\b",
+    r"\b(?:stock price|share price|market price|exchange rate|crypto price|gas prices?)\b",
+    r"\b(?:score|standings|sports schedule|game tonight|kickoff time)\b",
+    r"\b(?:flight status|train status|traffic|road closure|power outage)\b",
+)
+_LIVE_TIME_WORDS = re.compile(
+    r"\b(?:today|tonight|tomorrow|currently|current|right now|live|latest|recent|"
+    r"this (?:morning|afternoon|evening|week|month|year))\b",
+    re.IGNORECASE,
+)
+_CHANGEABLE_TOPICS = re.compile(
+    r"\b(?:weather|news|price|rate|score|schedule|availability|hours|election|"
+    r"president|governor|mayor|ceo|law|rule|policy|release|version|event|concert|"
+    r"flight|traffic|market|stock|crypto|restaurant|store)\b",
+    re.IGNORECASE,
+)
+
+
+def current_information_requires_web(user_text):
+    """Detect natural requests whose correct answer depends on live information."""
+    text = str(user_text or "")
+    if re.search(r"https?://[^\s]+", text, flags=re.IGNORECASE):
+        return True
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _ALWAYS_LIVE_PATTERNS):
+        return True
+    if _LIVE_TIME_WORDS.search(text) and _CHANGEABLE_TOPICS.search(text):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:search|browse|look up|check|find)\b[\s\S]{0,45}"
+            r"\b(?:web|online|internet|sources?|website)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def adaptive_conversation_prompt(history, recent_user_messages=None):
+    """Infer presentation preferences without exposing or copying old chat content."""
+    current_history = history if isinstance(history, list) else []
+    global_history = recent_user_messages if isinstance(recent_user_messages, list) else []
+    user_texts = [
+        str(item.get("content") or "").strip()
+        for item in [*global_history, *current_history]
+        if isinstance(item, dict) and item.get("role") == "user" and item.get("content")
+    ][-40:]
+    if not user_texts:
+        return ""
+    recent = " ".join(user_texts[-6:]).lower()
+    average_words = sum(len(text.split()) for text in user_texts) / len(user_texts)
+    instructions = [
+        "Adapt presentation to the user's demonstrated communication style without "
+        "mimicking insults, profanity, spelling errors, or unsafe behavior. Preserve "
+        "facts and needed caveats even when shortening."
+    ]
+    if re.search(r"\b(?:too long|shorter|brief|concise|just answer|straight answer|stop explaining)\b", recent):
+        instructions.append("The user has recently asked for less text: answer directly and briefly.")
+    elif average_words <= 10:
+        instructions.append("The user usually writes briefly; lead with a compact answer and expand only when useful.")
+    if re.search(r"\b(?:that'?s wrong|you'?re wrong|doesn'?t work|not what i asked|horrible|frustrat)\b", recent):
+        instructions.append("The user is correcting a failure: acknowledge it once, fix it directly, and avoid defensiveness or repeated instructions.")
+    instructions.append("Resolve pronouns and follow-ups from the current conversation instead of treating every turn as a new topic.")
+    return " ".join(instructions)
 
 
 _SAFE_BINARY_OPERATORS = {
@@ -1616,6 +1695,16 @@ def sanitize_assistant_text(value):
     )
     value = re.sub(
         r"(?i)\b(sk|pk|whsec)_[a-z0-9_-]{12,}\b",
+        "[private credential]",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\b(?:sk-(?:proj|live)-|gh[oprsu]_|sbp_|vrn_live_)[a-z0-9_-]{16,}\b",
+        "[private credential]",
+        value,
+    )
+    value = re.sub(
+        r"\beyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{16,}\b",
         "[private credential]",
         value,
     )
@@ -3689,6 +3778,12 @@ def chat_stream():
             + (["data_analysis"] if has_code_execution_attachment else [])
         )
     )
+    # Deep research already includes live web search. Keeping both would charge
+    # twice and could accidentally retain the smaller ordinary-search budget.
+    if "deep_research" in requested_tools:
+        requested_tools = [
+            tool_id for tool_id in requested_tools if tool_id != "web_search"
+        ]
     provider_tools, tool_system_parts, tool_feature_ids = (
         selected_tool_configuration(requested_tools)
     )
@@ -3769,10 +3864,13 @@ def chat_stream():
             "conversation_id": f"eq.{conversation_id}",
             "user_id": f"eq.{g.user_id}",
             "role": "in.(user,assistant)",
-            "order": "created_at.asc",
-            "limit": "30",
+            "order": "created_at.desc",
+            "limit": "60",
         },
     ) or []
+    # The database returns newest-first so the capped window contains the latest
+    # context; model messages still need chronological order.
+    previous.reverse()
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
     now = utc_now()
@@ -3973,6 +4071,17 @@ def chat_stream():
         },
     ) or []
     profile = profile_rows[0] if profile_rows else {}
+    recent_user_messages = supabase_request(
+        "GET",
+        "messages",
+        params={
+            "select": "role,content",
+            "user_id": f"eq.{g.user_id}",
+            "role": "eq.user",
+            "order": "created_at.desc",
+            "limit": "24",
+        },
+    ) or []
     user_context = []
     project = (
         get_owned_project(conversation.get("project_id"), g.user_id)
@@ -4026,18 +4135,22 @@ def chat_stream():
         "clearly requires it, so do not incorrectly tell the user that these "
         "controls or tools do not exist. Voice conversations are available. "
         "Describe only tools that were actually enabled for this "
-        "request, and never pretend a tool ran when it did not. When Web "
+        "request, and never pretend a tool ran when it did not. "
         "Image generation status is controlled by the image-generation "
         "pipeline. Never say an image is generating, rendering, running, or "
         "will appear shortly unless the image_generation tool is actually "
         "enabled for this request. When it is not enabled, answer normally "
         "without inventing background work. When Web "
         "Search is enabled, never claim that Vurenn has no internet access. "
+        "Use it immediately for weather, current news, prices, schedules, scores, "
+        "public-office holders, current product facts, and other changeable claims. "
+        "Do not ask the user to say 'search' or repeat the question. "
         "If one particular URL is private, expired, or blocks automated "
         "access, explain that the specific link could not be opened and ask "
         "for a public sharing link or uploaded file instead. "
         f"{SAFETY_PROMPT} {model['style']} "
         f"{response_preference_prompt(profile.get('response_preferences'))} "
+        f"{adaptive_conversation_prompt(previous, recent_user_messages)} "
         + " ".join(tool_system_parts + user_context)
     )
     if voice_mode:
@@ -4058,6 +4171,7 @@ def chat_stream():
         full_text = []
         pending_text = ""
         usage = {"input_tokens": 0, "output_tokens": 0}
+        usage_data = {}
         balance_after = starting_balance
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
@@ -4167,7 +4281,7 @@ def chat_stream():
                             "tool_name": tool_id,
                             "subject": subject,
                             "estimated_seconds": (
-                                180 if tool_id == "deep_research" else 45
+                                480 if tool_id == "deep_research" else 45
                             ),
                         },
                     )
@@ -4216,6 +4330,68 @@ def chat_stream():
                         time.sleep(0.75)
                 if provider_error is not None:
                     raise provider_error
+                provider_responses = [final]
+                continuation_messages = list(create_kwargs["messages"])
+                continuation_rounds = 0
+                while (
+                    getattr(final, "stop_reason", None) == "pause_turn"
+                    and continuation_rounds < 5
+                ):
+                    continuation_rounds += 1
+                    progress_tool = (
+                        "deep_research"
+                        if "deep_research" in requested_tools
+                        else requested_tools[0]
+                    )
+                    yield sse(
+                        "tool_progress",
+                        {
+                            "tool_call_id": progress_tool,
+                            "tool_name": progress_tool,
+                            "subject": user_text.strip()[:140],
+                            "stage_index": min(4, continuation_rounds),
+                            "estimated_seconds": 480,
+                        },
+                    )
+                    continuation_messages.append(
+                        {"role": "assistant", "content": final.content}
+                    )
+                    continuation_kwargs = {
+                        **create_kwargs,
+                        "messages": continuation_messages,
+                    }
+                    if owned_attachments:
+                        final = anthropic_client.beta.messages.create(
+                            **continuation_kwargs,
+                            betas=["files-api-2025-04-14"],
+                        )
+                    else:
+                        final = anthropic_client.messages.create(
+                            **continuation_kwargs
+                        )
+                    provider_responses.append(final)
+
+                aggregate_tool_use = {}
+                for provider_response in provider_responses:
+                    response_usage = (
+                        provider_response.usage.model_dump()
+                        if hasattr(provider_response.usage, "model_dump")
+                        else dict(provider_response.usage)
+                    )
+                    usage_data["input_tokens"] = int(
+                        usage_data.get("input_tokens", 0)
+                    ) + int(response_usage.get("input_tokens", 0) or 0)
+                    usage_data["output_tokens"] = int(
+                        usage_data.get("output_tokens", 0)
+                    ) + int(response_usage.get("output_tokens", 0) or 0)
+                    for key, value in (
+                        response_usage.get("server_tool_use") or {}
+                    ).items():
+                        aggregate_tool_use[key] = int(
+                            aggregate_tool_use.get(key, 0)
+                        ) + int(value or 0)
+                usage_data["server_tool_use"] = aggregate_tool_use
+
                 for block in final.content:
                     block_data = (
                         block.model_dump()
@@ -4321,7 +4497,7 @@ def chat_stream():
                         time.sleep(0.75)
                 if provider_error is not None:
                     raise provider_error
-            if local_answer is None and not image_request:
+            if local_answer is None and not image_request and not usage_data:
                 usage_data = (
                     final.usage.model_dump()
                     if hasattr(final.usage, "model_dump")

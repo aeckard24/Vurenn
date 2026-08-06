@@ -226,6 +226,8 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("web_search_20260318", provider_types)
         self.assertIn("code_execution_20260521", provider_types)
         self.assertIn("deep_research", feature_ids)
+        web_tool = next(tool for tool in provider_tools if tool["type"] == "web_search_20260318")
+        self.assertEqual(web_tool["max_uses"], 20)
 
     def test_excel_workbooks_are_routed_to_sandboxed_analysis(self):
         excel_type = (
@@ -245,6 +247,20 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(
             wsgi.infer_requested_tools("Please search the web for current information"),
             ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools(
+                "what's the weather today in Bellefontaine Ohio?"
+            ),
+            ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools("Who won the game tonight?"),
+            ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools("Explain why rain forms."),
+            [],
         )
         self.assertEqual(
             wsgi.infer_requested_tools("Deep research this market for me"),
@@ -371,6 +387,28 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("Do not repeat an unsupported premise as fact", prompt)
         self.assertIn("Cite only sources actually returned by a tool", prompt)
         self.assertIn("clearly labeled uncertainty", prompt)
+
+    def test_adaptive_context_responds_to_user_corrections(self):
+        prompt = wsgi.adaptive_conversation_prompt(
+            [
+                {"role": "user", "content": "That is too long. Just answer."},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": "This still doesn't work."},
+            ]
+        )
+        self.assertIn("answer directly and briefly", prompt)
+        self.assertIn("avoid defensiveness", prompt)
+
+    def test_assistant_output_redacts_common_secret_formats(self):
+        value = (
+            "sk-proj-abcdefghijklmnopqrstuvwxyz123456 "
+            "gho_abcdefghijklmnopqrstuvwxyz123456 "
+            "vrn_live_abcdefghijklmnopqrstuvwxyz123456"
+        )
+        cleaned = wsgi.sanitize_assistant_text(value)
+        self.assertNotIn("sk-proj-", cleaned)
+        self.assertNotIn("gho_", cleaned)
+        self.assertNotIn("vrn_live_", cleaned)
 
     def test_project_intelligence_requires_real_tool_results(self):
         prompt = wsgi.PROJECT_INTELLIGENCE_PROMPT
