@@ -135,7 +135,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
             wsgi.image_request_subject(
                 "make me a image of a Jeep Cherokee 2019 Trailhawk"
             ),
-            "a Jeep Cherokee 2019 Trailhawk",
+            "2019 Jeep Cherokee Trailhawk",
         )
         self.assertEqual(
             wsgi.infer_requested_tools("Explain this", has_attachments=True),

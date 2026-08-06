@@ -987,7 +987,19 @@ def image_request_subject(prompt):
         subject,
         flags=re.IGNORECASE,
     ).strip(" .!?\t\r\n")
-    return (subject or "your image")[:110]
+    if not subject:
+        return "your image"
+    year_after_model = re.match(
+        r"^(?:an?\s+)?(.+?)\s+((?:19|20)\d{2})\s+(.+)$",
+        subject,
+        flags=re.IGNORECASE,
+    )
+    if year_after_model:
+        subject = (
+            f"{year_after_model.group(2)} {year_after_model.group(1)} "
+            f"{year_after_model.group(3)}"
+        )
+    return subject[:110]
 
 
 def image_prompt_needs_research(prompt):
