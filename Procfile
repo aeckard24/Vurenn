@@ -1,1 +1,1 @@
-web: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 720 wsgi:app
+web: gunicorn --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 12 --timeout 720 --graceful-timeout 30 --keep-alive 5 wsgi:app

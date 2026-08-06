@@ -20,13 +20,15 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote, urlparse
 
 import requests
 import stripe
 from anthropic import Anthropic
 from flask import Flask, Response, g, jsonify, request
+from PIL import Image
 from stripe._error import SignatureVerificationError
+from werkzeug.exceptions import HTTPException
 
 
 app = Flask(__name__)
@@ -50,6 +52,9 @@ OPENAI_IMAGE_SIZE = os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_TIMEOUT_SECONDS = int(
     os.environ.get("OPENAI_IMAGE_TIMEOUT_SECONDS", "180")
 )
+OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "")
+OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "tts-1-hd")
+LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-06")
 GENERATED_IMAGE_BUCKET = os.environ.get(
     "GENERATED_IMAGE_BUCKET", "vurenn-generated-images"
 )
@@ -441,6 +446,17 @@ DEFAULT_JOURNAL_CONTENT = {
     ),
     "updates": [
         {
+            "date": "August 6, 2026",
+            "category": "Vurenn Labs",
+            "title": "The 50-feature Intelligence Program is live",
+            "summary": (
+                "A new Labs catalog makes Vurenn's reasoning, personal intelligence, "
+                "projects, voice, privacy, and safety roadmap visible. Guided workflows "
+                "that work today can be launched directly; beta, foundation, and planned "
+                "work is labeled honestly."
+            ),
+        },
+        {
             "date": "August 3, 2026",
             "category": "Product",
             "title": "Vurenn Voice returns",
@@ -619,7 +635,14 @@ def journal_content():
             params={"select": "value", "key": "eq.journal_content", "limit": "1"},
         ) or []
         if rows:
-            return normalize_journal_content(rows[0].get("value"))
+            content = normalize_journal_content(rows[0].get("value"))
+            launch_update = DEFAULT_JOURNAL_CONTENT["updates"][0]
+            if not any(
+                item.get("title") == launch_update["title"]
+                for item in content["updates"]
+            ):
+                content["updates"] = [dict(launch_update), *content["updates"]][:12]
+            return content
     except Exception:
         app.logger.exception("Could not read journal content")
     return normalize_journal_content(DEFAULT_JOURNAL_CONTENT)
@@ -789,6 +812,52 @@ def safety_category(value):
     return None
 
 
+def record_abuse_event(user_id, category, content):
+    """Store a privacy-minimized safety event without retaining the prompt."""
+    try:
+        secret = GENERATED_IMAGE_SIGNING_SECRET or SUPABASE_SERVICE_ROLE_KEY
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            str(content).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        supabase_request(
+            "POST",
+            "abuse_events",
+            body={
+                "user_id": user_id,
+                "category": str(category)[:80],
+                "content_hash": digest,
+                "request_id": getattr(g, "request_id", None),
+            },
+            prefer="return=minimal",
+        )
+    except Exception:
+        app.logger.exception("Could not record a safety event")
+
+
+@app.before_request
+def assign_request_id():
+    g.request_id = str(request.headers.get("X-Request-ID") or uuid.uuid4())[:80]
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    app.logger.exception(
+        "Unhandled request error request_id=%s",
+        getattr(g, "request_id", "unknown"),
+    )
+    return api_error(
+        500,
+        "internal_error",
+        "Vurenn could not complete that request. Try again.",
+        retryable=True,
+        details={"request_id": getattr(g, "request_id", None)},
+    )
+
+
 @app.after_request
 def add_security_headers(response):
     origin = request.headers.get("Origin", "").rstrip("/")
@@ -807,9 +876,11 @@ def add_security_headers(response):
     response.headers["Permissions-Policy"] = (
         "camera=(self), microphone=(self), geolocation=()"
     )
+    response.headers["X-Request-ID"] = getattr(g, "request_id", "")
     if request.path.startswith(
         (
             "/v1/admin",
+            "/v1/invites",
             "/v1/credits",
             "/v1/profile",
             "/v1/team-mode",
@@ -973,6 +1044,97 @@ def generate_image(prompt, user_id):
     return store_generated_image(user_id, generate_image_bytes(prompt))
 
 
+def generated_image_object_from_url(image_url, user_id):
+    parsed = urlparse(str(image_url or ""))
+    prefix = "/v1/generated-images/"
+    if not parsed.path.startswith(prefix):
+        return None
+    object_path = unquote(parsed.path[len(prefix):])
+    query_token = ""
+    for pair in parsed.query.split("&"):
+        key, _, value = pair.partition("=")
+        if key == "token":
+            query_token = value
+            break
+    expected_prefix = f"{user_id}/"
+    if (
+        not object_path.startswith(expected_prefix)
+        or not re.fullmatch(r"[0-9a-fA-F-]{32,36}/[0-9a-f]{32}\.webp", object_path)
+        or not hmac.compare_digest(query_token, generated_image_token(object_path))
+    ):
+        return None
+    return object_path
+
+
+def fetch_generated_image_bytes(object_path):
+    response = requests.get(
+        (
+            f"{SUPABASE_URL}/storage/v1/object/"
+            f"{quote(GENERATED_IMAGE_BUCKET, safe='')}/"
+            f"{quote(object_path, safe='/')}"
+        ),
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+        timeout=30,
+    )
+    if response.status_code != 200 or len(response.content) > 20 * 1024 * 1024:
+        raise RuntimeError("IMAGE_NOT_FOUND")
+    return response.content
+
+
+def edit_image_bytes(source_bytes, mask_bytes, prompt):
+    try:
+        with Image.open(io.BytesIO(source_bytes)) as source:
+            source = source.convert("RGBA")
+            source_buffer = io.BytesIO()
+            source.save(source_buffer, format="PNG")
+            source_size = source.size
+        with Image.open(io.BytesIO(mask_bytes)) as mask:
+            mask = mask.convert("RGBA")
+            if mask.size != source_size:
+                raise ValueError("mask size mismatch")
+            mask_buffer = io.BytesIO()
+            mask.save(mask_buffer, format="PNG")
+    except (OSError, ValueError) as error:
+        raise RuntimeError("INVALID_IMAGE_MASK") from error
+
+    response = requests.post(
+        "https://api.openai.com/v1/images/edits",
+        headers={"Authorization": f"Bearer {OPENAI_IMAGE_API_KEY}"},
+        files={
+            "image[]": ("source.png", source_buffer.getvalue(), "image/png"),
+            "mask": ("mask.png", mask_buffer.getvalue(), "image/png"),
+        },
+        data={
+            "model": OPENAI_IMAGE_MODEL,
+            "prompt": prompt,
+            "size": OPENAI_IMAGE_SIZE,
+            "quality": OPENAI_IMAGE_QUALITY,
+            "output_format": "webp",
+        },
+        timeout=(15, OPENAI_IMAGE_TIMEOUT_SECONDS),
+    )
+    if response.status_code >= 400:
+        app.logger.error(
+            "Image edit provider request failed (%s): %s",
+            response.status_code,
+            response.text[:300],
+        )
+        raise RuntimeError("IMAGE_PROVIDER_ERROR")
+    encoded = ((response.json().get("data") or [{}])[0]).get("b64_json")
+    if not encoded:
+        raise RuntimeError("IMAGE_PROVIDER_EMPTY_RESPONSE")
+    try:
+        result = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as error:
+        raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE") from error
+    if not result or len(result) > 20 * 1024 * 1024:
+        raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE")
+    return result
+
+
 def image_request_subject(prompt):
     subject = re.sub(
         r"^\s*(?:please\s+)?(?:can|could|would)\s+you\s+",
@@ -1103,8 +1265,29 @@ def is_admin(user):
     return user_email(user) in ADMIN_EMAILS
 
 
-def can_bypass_maintenance(user):
-    return user_email(user) in (ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS)
+def has_private_beta_access(user_id):
+    if not user_id:
+        return False
+    try:
+        rows = supabase_request(
+            "GET",
+            "profiles",
+            params={
+                "select": "beta_access",
+                "user_id": f"eq.{user_id}",
+                "limit": "1",
+            },
+        ) or []
+        return bool(rows and rows[0].get("beta_access"))
+    except Exception:
+        app.logger.exception("Could not verify private beta access")
+        return False
+
+
+def can_bypass_maintenance(user, user_id=None):
+    if user_email(user) in (ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS):
+        return True
+    return has_private_beta_access(user_id or user.get("id"))
 
 
 def model_allowed(plan_id, model):
@@ -1548,6 +1731,41 @@ def synthesize_wav(text, voice_id=None):
     return output.getvalue()
 
 
+OPENAI_VOICE_MAP = {
+    "af_heart": "nova",
+    "af_bella": "shimmer",
+    "af_nicole": "alloy",
+    "am_michael": "onyx",
+    "am_liam": "echo",
+}
+
+
+def synthesize_openai_speech(text, voice_id):
+    response = requests.post(
+        "https://api.openai.com/v1/audio/speech",
+        headers={
+            "Authorization": f"Bearer {OPENAI_VOICE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": OPENAI_VOICE_MODEL,
+            "voice": OPENAI_VOICE_MAP.get(voice_id, "alloy"),
+            "input": text,
+            "response_format": "mp3",
+            "speed": max(0.8, min(1.2, TTS_SPEED)),
+        },
+        timeout=(10, 90),
+    )
+    if response.status_code >= 400 or not response.content:
+        app.logger.error(
+            "OpenAI speech failed (%s): %s",
+            response.status_code,
+            response.text[:200],
+        )
+        raise RuntimeError("VOICE_PROVIDER_ERROR")
+    return response.content
+
+
 def warm_tts_engine():
     try:
         get_tts_engine()
@@ -1824,6 +2042,137 @@ def generated_image(object_path):
     )
 
 
+@app.route("/v1/images/edit", methods=["POST", "OPTIONS"])
+@auth_required
+def edit_generated_image():
+    if not image_service_configured():
+        return api_error(503, "image_service_not_configured", "Vurenn Image is unavailable.")
+    payload = request.get_json(silent=True) or {}
+    prompt = str(payload.get("prompt") or "").strip()
+    message_id = str(payload.get("message_id") or "")
+    mask_data_url = str(payload.get("mask") or "")
+    if not prompt or len(prompt) > 2000:
+        return api_error(422, "invalid_prompt", "Describe the image change in 1-2,000 characters.")
+    object_path = generated_image_object_from_url(payload.get("image_url"), g.user_id)
+    if not object_path:
+        return api_error(404, "image_not_found", "That generated image is unavailable.")
+    message_rows = supabase_request(
+        "GET",
+        "messages",
+        params={
+            "select": "id,content,role",
+            "id": f"eq.{message_id}",
+            "user_id": f"eq.{g.user_id}",
+            "limit": "1",
+        },
+    ) or []
+    if not message_rows or message_rows[0].get("role") != "assistant":
+        return api_error(404, "message_not_found", "That image response was not found.")
+    match = re.fullmatch(r"data:image/png;base64,([A-Za-z0-9+/=]+)", mask_data_url)
+    if not match:
+        return api_error(422, "invalid_mask", "Paint the part of the image you want changed.")
+    try:
+        mask_bytes = base64.b64decode(match.group(1), validate=True)
+    except (ValueError, TypeError):
+        return api_error(422, "invalid_mask", "The selected image area is invalid.")
+    if not mask_bytes or len(mask_bytes) > 8 * 1024 * 1024:
+        return api_error(413, "mask_too_large", "The selected image area is too large.")
+
+    cost = USAGE_COSTS["image_generation"]["credits"]
+    request_key = str(request.headers.get("X-Idempotency-Key") or uuid.uuid4())[:160]
+    metered = user_plan(g.user, g.user_id) == "free"
+    if metered:
+        try:
+            spend_credits(
+                g.user_id,
+                cost,
+                "image_edit",
+                f"image-edit:{g.user_id}:{request_key}",
+                {"source": object_path},
+            )
+        except RuntimeError as error:
+            if "INSUFFICIENT_CREDITS" in str(error):
+                return api_error(402, "insufficient_credits", "You need more Vurenn credits to edit this image.")
+            raise
+    try:
+        source_bytes = fetch_generated_image_bytes(object_path)
+        edited_bytes = edit_image_bytes(source_bytes, mask_bytes, prompt)
+        image_url = store_generated_image(g.user_id, edited_bytes)
+        existing_content = str(message_rows[0].get("content") or "")
+        supabase_request(
+            "PATCH",
+            "messages",
+            params={"id": f"eq.{message_id}", "user_id": f"eq.{g.user_id}"},
+            body={
+                "content": (
+                    f"{existing_content.rstrip()}\n\n"
+                    f"**Edited image**\n\n![Edited image]({image_url})"
+                )
+            },
+            prefer="return=minimal",
+        )
+    except RuntimeError as error:
+        if metered:
+            try:
+                refund_credits(
+                    g.user_id,
+                    cost,
+                    "image_edit",
+                    f"refund:image-edit:{g.user_id}:{request_key}",
+                    {"reason": str(error)},
+                )
+            except Exception:
+                app.logger.exception("Could not refund failed image edit")
+        if str(error) == "INVALID_IMAGE_MASK":
+            return api_error(422, "invalid_mask", "The selected area could not be read.")
+        app.logger.exception("Image edit failed")
+        return api_error(502, "image_edit_failed", "Vurenn could not edit that image. Try again.", retryable=True)
+    return jsonify({"url": image_url, "credits_used": cost if metered else 0})
+
+
+@app.route("/v1/messages/<message_id>/feedback", methods=["PUT", "DELETE", "OPTIONS"])
+@auth_required
+def message_feedback(message_id):
+    messages = supabase_request(
+        "GET",
+        "messages",
+        params={
+            "select": "id,role",
+            "id": f"eq.{message_id}",
+            "user_id": f"eq.{g.user_id}",
+            "limit": "1",
+        },
+    ) or []
+    if not messages or messages[0].get("role") != "assistant":
+        return api_error(404, "message_not_found", "That response was not found.")
+    if request.method == "DELETE":
+        supabase_request(
+            "DELETE",
+            "message_feedback",
+            params={"message_id": f"eq.{message_id}", "user_id": f"eq.{g.user_id}"},
+        )
+        return "", 204
+    payload = request.get_json(silent=True) or {}
+    rating = payload.get("rating")
+    if rating not in {-1, 1}:
+        return api_error(422, "invalid_rating", "Choose thumbs up or thumbs down.")
+    comment = str(payload.get("comment") or "").strip()[:1000]
+    rows = supabase_request(
+        "POST",
+        "message_feedback",
+        params={"on_conflict": "user_id,message_id"},
+        body={
+            "user_id": g.user_id,
+            "message_id": message_id,
+            "rating": rating,
+            "comment": comment,
+            "updated_at": utc_now(),
+        },
+        prefer="resolution=merge-duplicates,return=representation",
+    ) or []
+    return jsonify({"rating": (rows[0] if rows else {}).get("rating", rating)})
+
+
 @app.route("/v1/usage-costs", methods=["GET"])
 def usage_costs():
     return jsonify(
@@ -1858,6 +2207,172 @@ def public_config():
     )
 
 
+def private_beta_invite(token):
+    token = str(token or "").strip()
+    if len(token) < 32 or len(token) > 160:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    rows = supabase_request(
+        "GET",
+        "private_beta_invites",
+        params={
+            "select": "id,label,email,expires_at,max_uses,use_count,revoked_at",
+            "token_hash": f"eq.{token_hash}",
+            "limit": "1",
+        },
+    ) or []
+    return rows[0] if rows else None
+
+
+def beta_invite_state(invite):
+    if not invite:
+        return "invalid"
+    if invite.get("revoked_at"):
+        return "revoked"
+    try:
+        expires_at = datetime.fromisoformat(
+            str(invite.get("expires_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "invalid"
+    if expires_at <= datetime.now(timezone.utc):
+        return "expired"
+    if int(invite.get("use_count") or 0) >= int(invite.get("max_uses") or 1):
+        return "full"
+    return "valid"
+
+
+@app.route("/v1/invites/validate", methods=["POST", "OPTIONS"])
+def validate_beta_invite():
+    if request.method == "OPTIONS":
+        return "", 204
+    payload = request.get_json(silent=True) or {}
+    try:
+        invite = private_beta_invite(payload.get("token"))
+    except Exception:
+        app.logger.exception("Could not validate private beta invite")
+        return api_error(503, "invite_service_unavailable", "The invitation service is temporarily unavailable.")
+    state = beta_invite_state(invite)
+    if state != "valid":
+        return api_error(410 if state != "invalid" else 404, f"invite_{state}", "This invitation is invalid, expired, revoked, or has already been used.")
+    email = str(invite.get("email") or "").strip().lower()
+    email_hint = ""
+    if email and "@" in email:
+        name, domain = email.split("@", 1)
+        email_hint = f"{name[:1]}***@{domain}"
+    return jsonify(
+        {
+            "valid": True,
+            "label": invite.get("label") or "Private beta invitation",
+            "expires_at": invite.get("expires_at"),
+            "remaining_uses": int(invite.get("max_uses") or 1) - int(invite.get("use_count") or 0),
+            "email_required": bool(email),
+            "email_hint": email_hint,
+        }
+    )
+
+
+@app.route("/v1/invites/redeem", methods=["POST", "OPTIONS"])
+@auth_required
+def redeem_beta_invite():
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("token") or "").strip()
+    if len(token) < 32 or len(token) > 160:
+        return api_error(400, "invalid_invite", "This invitation is invalid.")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    try:
+        result = supabase_request(
+            "POST",
+            "rpc/redeem_private_beta_invite",
+            body={
+                "p_token_hash": token_hash,
+                "p_user_id": g.user_id,
+                "p_user_email": user_email(g.user),
+            },
+        )
+    except Exception:
+        app.logger.exception("Could not redeem private beta invite")
+        return api_error(503, "invite_service_unavailable", "The invitation could not be redeemed right now.")
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    result = result if isinstance(result, dict) else {}
+    if not result.get("ok"):
+        messages = {
+            "invalid_invite": "This invitation is invalid.",
+            "revoked_invite": "This invitation was revoked.",
+            "expired_invite": "This invitation has expired.",
+            "email_mismatch": "Sign in with the email address this invitation was sent to.",
+            "invite_full": "This invitation has already been fully used.",
+        }
+        code = str(result.get("code") or "invalid_invite")
+        return api_error(403, code, messages.get(code, "This invitation cannot be used."))
+    return jsonify({"redeemed": True, "label": result.get("label") or "Private beta"})
+
+
+@app.route("/v1/admin/invites", methods=["GET", "POST", "OPTIONS"])
+@admin_required
+def admin_beta_invites():
+    if request.method == "GET":
+        rows = supabase_request(
+            "GET",
+            "private_beta_invites",
+            params={
+                "select": "id,label,email,expires_at,max_uses,use_count,revoked_at,created_at",
+                "order": "created_at.desc",
+                "limit": "100",
+            },
+        ) or []
+        return jsonify({"items": rows})
+
+    payload = request.get_json(silent=True) or {}
+    label = str(payload.get("label") or "Private beta guest").strip()[:80]
+    email = str(payload.get("email") or "").strip().lower()[:320] or None
+    if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        return api_error(400, "invalid_email", "Enter a valid email address or leave it blank.")
+    try:
+        days = max(1, min(30, int(payload.get("expires_in_days") or 7)))
+        max_uses = max(1, min(25, int(payload.get("max_uses") or 1)))
+    except (TypeError, ValueError):
+        return api_error(400, "invalid_invite_limits", "Invitation limits are invalid.")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    created = supabase_request(
+        "POST",
+        "private_beta_invites",
+        body={
+            "token_hash": token_hash,
+            "label": label,
+            "email": email,
+            "expires_at": expires_at,
+            "max_uses": max_uses,
+            "created_by": g.user_id,
+        },
+        prefer="return=representation",
+    )
+    item = created[0]
+    item.pop("token_hash", None)
+    item["invite_url"] = f"{FRONTEND_URL}/invite/{token}"
+    return jsonify(item), 201
+
+
+@app.route("/v1/admin/invites/<invite_id>", methods=["DELETE", "OPTIONS"])
+@admin_required
+def revoke_beta_invite(invite_id):
+    try:
+        uuid.UUID(invite_id)
+    except ValueError:
+        return api_error(400, "invalid_invite_id", "Invitation ID is invalid.")
+    supabase_request(
+        "PATCH",
+        "private_beta_invites",
+        params={"id": f"eq.{invite_id}"},
+        body={"revoked_at": utc_now()},
+        prefer="return=minimal",
+    )
+    return "", 204
+
+
 @app.route("/v1/public/journal", methods=["GET"])
 def public_journal():
     return jsonify(journal_content())
@@ -1869,7 +2384,7 @@ def maintenance_access():
     return jsonify(
         {
             "enabled": construction_mode_enabled(),
-            "allowed": can_bypass_maintenance(g.user),
+            "allowed": can_bypass_maintenance(g.user, g.user_id),
         }
     )
 
@@ -2201,7 +2716,7 @@ def profile():
                     "display_name,occupation,goals,response_style,"
                     "onboarding_completed,onboarding_skipped,"
                     "security_prompt_dismissed,camera_unlock_enabled,"
-                    "response_preferences"
+                    "response_preferences,legal_version,legal_accepted_at"
                 ),
                 "user_id": f"eq.{g.user_id}",
                 "limit": "1",
@@ -2267,6 +2782,65 @@ def profile():
         prefer="return=representation",
     )
     return jsonify(updated[0] if updated else values)
+
+
+@app.route("/v1/legal/consent", methods=["POST", "OPTIONS"])
+@auth_required
+def legal_consent():
+    payload = request.get_json(silent=True) or {}
+    version = str(payload.get("policy_version") or "").strip()
+    accepted_at = str(payload.get("accepted_at") or "").strip()
+    acceptance_method = str(payload.get("acceptance_method") or "policy_update").strip()
+    accepted_all = all(
+        payload.get(field) is True
+        for field in (
+            "terms_accepted",
+            "privacy_accepted",
+            "acceptable_use_accepted",
+        )
+    )
+    if version != LEGAL_POLICY_VERSION or not accepted_all:
+        return api_error(
+            422,
+            "legal_consent_required",
+            "Accept the current Terms, Privacy Policy, and Acceptable Use Policy.",
+        )
+    if acceptance_method not in {"oauth_signup", "policy_update"}:
+        return api_error(422, "invalid_consent_method", "That consent method is invalid.")
+    try:
+        parsed_at = datetime.fromisoformat(accepted_at.replace("Z", "+00:00"))
+        if parsed_at.tzinfo is None:
+            raise ValueError("timezone required")
+    except (TypeError, ValueError):
+        return api_error(422, "invalid_consent_time", "A valid consent time is required.")
+    canonical_time = parsed_at.astimezone(timezone.utc).isoformat()
+    supabase_request(
+        "POST",
+        "legal_consents",
+        params={"on_conflict": "user_id,policy_version"},
+        body={
+            "user_id": g.user_id,
+            "policy_version": version,
+            "terms_accepted": True,
+            "privacy_accepted": True,
+            "acceptable_use_accepted": True,
+            "accepted_at": canonical_time,
+            "acceptance_method": acceptance_method,
+        },
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+    supabase_request(
+        "PATCH",
+        "profiles",
+        params={"user_id": f"eq.{g.user_id}"},
+        body={
+            "legal_version": version,
+            "legal_accepted_at": canonical_time,
+            "updated_at": utc_now(),
+        },
+        prefer="return=minimal",
+    )
+    return jsonify({"accepted": True, "policy_version": version, "accepted_at": canonical_time})
 
 
 @app.route("/v1/api-keys", methods=["GET", "POST", "OPTIONS"])
@@ -2354,8 +2928,10 @@ def voice_config():
             "status": "available" if VOICE_ENABLED else "coming_soon",
             "transport": "server-neural",
             "speech_recognition": "web-speech-api",
-            "speech_synthesis": "vurenn-neural",
-            "neural_ready": _tts_ready,
+            "speech_synthesis": (
+                "openai-neural" if OPENAI_VOICE_API_KEY else "vurenn-neural"
+            ),
+            "neural_ready": bool(OPENAI_VOICE_API_KEY) or _tts_ready,
             "fallback_synthesis": "speech-synthesis-api",
             "default_voice_id": (
                 TTS_VOICE if TTS_VOICE in TTS_VOICES else "af_heart"
@@ -2366,9 +2942,9 @@ def voice_config():
             ],
             "credit_cost": USAGE_COSTS["voice_turn"]["credits"],
             "privacy": (
-                "Speech input is transcribed by the browser. Completed Vurenn "
-                "replies are converted to audio on the Vurenn server and are "
-                "not retained as voice recordings."
+                "Speech input is transcribed by the browser. Completed replies "
+                "may be sent to Vurenn's configured speech provider to create "
+                "audio. Vurenn does not retain generated voice recordings."
             ),
         }
     )
@@ -2384,7 +2960,7 @@ def voice_synthesize():
             "Vurenn Voice is coming soon.",
             retryable=False,
         )
-    if construction_mode_enabled() and not can_bypass_maintenance(g.user):
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user, g.user_id):
         return api_error(
             503,
             "under_construction",
@@ -2436,7 +3012,12 @@ def voice_synthesize():
     if not text:
         return api_error(422, "empty_voice_reply", "There is no reply to speak.")
     try:
-        audio = synthesize_wav(text, voice_id)
+        using_openai = bool(OPENAI_VOICE_API_KEY)
+        audio = (
+            synthesize_openai_speech(text, voice_id)
+            if using_openai
+            else synthesize_wav(text, voice_id)
+        )
     except Exception:
         app.logger.exception("Neural voice synthesis failed")
         return api_error(
@@ -2447,11 +3028,17 @@ def voice_synthesize():
         )
     return Response(
         audio,
-        mimetype="audio/wav",
+        mimetype="audio/mpeg" if using_openai else "audio/wav",
         headers={
             "Cache-Control": "private, max-age=3600",
-            "Content-Disposition": f'inline; filename="vurenn-{message_id}.wav"',
-            "X-Voice-Engine": "vurenn-neural",
+            "Content-Disposition": (
+                f'inline; filename="vurenn-{message_id}.mp3"'
+                if using_openai
+                else f'inline; filename="vurenn-{message_id}.wav"'
+            ),
+            "X-Voice-Engine": (
+                "openai-neural" if using_openai else "vurenn-neural"
+            ),
         },
     )
 
@@ -3087,7 +3674,7 @@ def chat_stream():
             else ("chat_max" if model_id == "vurenn-max" else "chat_balanced")
         )
     )
-    if construction_mode_enabled() and not can_bypass_maintenance(g.user):
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user, g.user_id):
         return api_error(
             503,
             "under_construction",
@@ -3114,6 +3701,7 @@ def chat_stream():
         )
     category = safety_category(user_text)
     if category in {"violent_instruction", "unsafe_robotics"}:
+        record_abuse_event(g.user_id, category, user_text)
         return api_error(
             422,
             "unsafe_request",
@@ -3527,8 +4115,7 @@ def chat_stream():
                 )
                 safe_text = (
                     "Here is your generated image.\n\n"
-                    f"![Generated image]({image_url})\n\n"
-                    f"[Download the full image]({image_url})"
+                    f"![Generated image]({image_url})"
                 )
                 full_text.append(safe_text)
                 yield sse("token", {"text": safe_text})
@@ -3543,9 +4130,17 @@ def chat_stream():
                 usage_data = {}
             elif requested_tools or owned_attachments:
                 for tool_id in requested_tools:
+                    subject = user_text.strip()[:140]
                     yield sse(
                         "tool_started",
-                        {"tool_call_id": tool_id, "tool_name": tool_id},
+                        {
+                            "tool_call_id": tool_id,
+                            "tool_name": tool_id,
+                            "subject": subject,
+                            "estimated_seconds": (
+                                180 if tool_id == "deep_research" else 45
+                            ),
+                        },
                     )
                 create_kwargs = {
                     "model": (
@@ -3817,7 +4412,7 @@ def chat_stream():
 @app.route("/v1/api/chat", methods=["POST", "OPTIONS"])
 @api_key_required
 def developer_chat():
-    if construction_mode_enabled() and not can_bypass_maintenance(g.user):
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user, g.user_id):
         return api_error(
             503,
             "under_construction",
@@ -3866,6 +4461,7 @@ def developer_chat():
             }
         )
     if category in {"violent_instruction", "unsafe_robotics"}:
+        record_abuse_event(g.user_id, category, user_text)
         return api_error(
             422,
             "unsafe_request",

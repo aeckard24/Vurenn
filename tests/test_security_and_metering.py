@@ -1,12 +1,69 @@
 import unittest
 import base64
+import io
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import wsgi
+from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_private_beta_invitation_is_redeemed_without_exposing_raw_token(self):
+        user_id = "11111111-1111-1111-1111-111111111111"
+        raw_token = "private-beta-token-" + "x" * 32
+
+        def database(method, path, **kwargs):
+            if path == "rpc/redeem_private_beta_invite":
+                self.assertNotEqual(kwargs["body"]["p_token_hash"], raw_token)
+                self.assertEqual(len(kwargs["body"]["p_token_hash"]), 64)
+                return {"ok": True, "label": "Grandma"}
+            return []
+
+        with patch.object(
+            wsgi, "authenticate", return_value={"id": user_id, "email": "grandma@example.com"}
+        ), patch.object(wsgi, "supabase_request", side_effect=database):
+            response = wsgi.app.test_client().post(
+                "/v1/invites/redeem",
+                json={"token": raw_token},
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["redeemed"])
+
+    def test_private_beta_access_bypasses_construction_mode(self):
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": "guest@example.com"}
+        with patch.object(wsgi, "has_private_beta_access", return_value=True):
+            self.assertTrue(wsgi.can_bypass_maintenance(user, user["id"]))
+
+    def test_current_legal_consent_is_versioned_and_recorded_privately(self):
+        user_id = "11111111-1111-1111-1111-111111111111"
+        payload = {
+            "policy_version": wsgi.LEGAL_POLICY_VERSION,
+            "accepted_at": "2026-08-06T15:30:00Z",
+            "terms_accepted": True,
+            "privacy_accepted": True,
+            "acceptable_use_accepted": True,
+        }
+        with patch.object(
+            wsgi, "authenticate", return_value={"id": user_id, "email": "user@example.com"}
+        ), patch.object(wsgi, "supabase_request", return_value=[]) as database:
+            response = wsgi.app.test_client().post(
+                "/v1/legal/consent",
+                json=payload,
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["accepted"])
+        consent_call = next(
+            call for call in database.call_args_list if call.args[1] == "legal_consents"
+        )
+        self.assertEqual(consent_call.kwargs["body"]["user_id"], user_id)
+        self.assertEqual(
+            consent_call.kwargs["body"]["policy_version"],
+            wsgi.LEGAL_POLICY_VERSION,
+        )
+
     def test_generated_image_links_are_signed(self):
         with patch.object(wsgi, "GENERATED_IMAGE_SIGNING_SECRET", "test-secret"):
             first = wsgi.generated_image_token(
@@ -17,6 +74,58 @@ class SecurityAndMeteringTests(unittest.TestCase):
             )
         self.assertEqual(len(first), 64)
         self.assertNotEqual(first, second)
+
+    def test_generated_image_edit_url_is_bound_to_its_owner(self):
+        owner = "11111111-1111-1111-1111-111111111111"
+        object_path = f"{owner}/{'a' * 32}.webp"
+        with patch.object(wsgi, "GENERATED_IMAGE_SIGNING_SECRET", "test-secret"):
+            token = wsgi.generated_image_token(object_path)
+            url = f"https://api.vurenn.com/v1/generated-images/{object_path}?token={token}"
+            self.assertEqual(
+                wsgi.generated_image_object_from_url(url, owner),
+                object_path,
+            )
+            self.assertIsNone(
+                wsgi.generated_image_object_from_url(
+                    url,
+                    "22222222-2222-2222-2222-222222222222",
+                )
+            )
+
+    def test_image_edit_uses_server_key_and_matching_png_files(self):
+        source_buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), "navy").save(source_buffer, format="WEBP")
+        mask_buffer = io.BytesIO()
+        Image.new("RGBA", (16, 16), (255, 255, 255, 0)).save(
+            mask_buffer,
+            format="PNG",
+        )
+        provider_response = Mock(
+            status_code=200,
+            json=lambda: {
+                "data": [
+                    {"b64_json": base64.b64encode(b"edited-webp").decode("ascii")}
+                ]
+            },
+        )
+        with patch.object(wsgi, "OPENAI_IMAGE_API_KEY", "server-image-key"), patch.object(
+            wsgi.requests,
+            "post",
+            return_value=provider_response,
+        ) as post:
+            result = wsgi.edit_image_bytes(
+                source_buffer.getvalue(),
+                mask_buffer.getvalue(),
+                "Add a warm sunset",
+            )
+        self.assertEqual(result, b"edited-webp")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer server-image-key",
+        )
+        self.assertEqual(post.call_args.kwargs["files"]["image[]"][2], "image/png")
+        self.assertEqual(post.call_args.kwargs["files"]["mask"][2], "image/png")
+        self.assertNotIn("server-image-key", str(post.call_args.kwargs["data"]))
 
     def test_image_generation_uses_only_the_server_image_key(self):
         provider_response = Mock(
@@ -44,6 +153,22 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["model"], "gpt-image-2")
         self.assertNotIn("server-image-key", str(post.call_args.kwargs["json"]))
         store.assert_called_once_with("user-1", b"webp-bytes")
+
+    def test_cloud_voice_uses_only_the_server_voice_key(self):
+        provider_response = Mock(status_code=200, content=b"mp3-audio", text="")
+        with patch.object(wsgi, "OPENAI_VOICE_API_KEY", "server-voice-key"), patch.object(
+            wsgi.requests,
+            "post",
+            return_value=provider_response,
+        ) as post:
+            audio = wsgi.synthesize_openai_speech("Hello there", "am_michael")
+        self.assertEqual(audio, b"mp3-audio")
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Authorization"],
+            "Bearer server-voice-key",
+        )
+        self.assertEqual(post.call_args.kwargs["json"]["voice"], "onyx")
+        self.assertNotIn("server-voice-key", str(post.call_args.kwargs["json"]))
 
     def test_provider_capacity_errors_use_a_fast_fallback(self):
         requested = wsgi.MODEL_CATALOG["vurenn"]["provider_model"]
