@@ -17,7 +17,7 @@ import time
 import uuid
 import wave
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote, quote_plus
@@ -929,7 +929,7 @@ def store_generated_image(user_id, image_bytes):
     )
 
 
-def generate_image(prompt, user_id):
+def generate_image_bytes(prompt):
     if not image_service_configured():
         raise RuntimeError("IMAGE_SERVICE_NOT_CONFIGURED")
     response = requests.post(
@@ -966,7 +966,80 @@ def generate_image(prompt, user_id):
         raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE") from error
     if not image_bytes or len(image_bytes) > 20 * 1024 * 1024:
         raise RuntimeError("IMAGE_PROVIDER_INVALID_RESPONSE")
-    return store_generated_image(user_id, image_bytes)
+    return image_bytes
+
+
+def generate_image(prompt, user_id):
+    return store_generated_image(user_id, generate_image_bytes(prompt))
+
+
+def image_request_subject(prompt):
+    subject = re.sub(
+        r"^\s*(?:please\s+)?(?:can|could|would)\s+you\s+",
+        "",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    subject = re.sub(
+        r"^\s*(?:make|create|generate|draw|design)\s+(?:me\s+)?"
+        r"(?:an?\s+)?(?:image|picture|photo|illustration)\s+(?:of\s+)?",
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    ).strip(" .!?\t\r\n")
+    return (subject or "your image")[:110]
+
+
+def image_prompt_needs_research(prompt):
+    return bool(
+        re.search(r"\b(?:19|20)\d{2}\b", prompt)
+        or re.search(
+            r"\b(?:accurate|authentic|realistic|specific model|vehicle|product)\b",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def research_image_prompt(prompt):
+    if not anthropic_client or not image_prompt_needs_research(prompt):
+        return prompt
+    try:
+        result = anthropic_client.messages.create(
+            model=MODEL_CATALOG["vurenn-fast"]["provider_model"],
+            max_tokens=650,
+            system=(
+                "Research only the visible, factual design details needed to "
+                "make this image accurate. Use current web sources where useful. "
+                "Return only a production-ready image prompt. Do not add commentary, "
+                "citations, claims about generation status, or safety disclaimers."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+            tools=[
+                {
+                    "type": "web_search_20260318",
+                    "name": "web_search",
+                    "max_uses": 2,
+                }
+            ],
+        )
+        text_blocks = []
+        for block in result.content:
+            block_data = (
+                block.model_dump()
+                if hasattr(block, "model_dump")
+                else dict(block)
+            )
+            if block_data.get("type") == "text" and block_data.get("text"):
+                text_blocks.append(str(block_data["text"]).strip())
+        refined = "\n".join(text_blocks).strip()
+        return refined[:6000] if refined else prompt
+    except Exception:
+        app.logger.warning(
+            "Image-reference research failed; using the original prompt",
+            exc_info=True,
+        )
+        return prompt
 
 
 def update_user_plan(user_id, plan_id):
@@ -1140,12 +1213,18 @@ def infer_requested_tools(user_text, has_attachments=False):
         )
     ):
         inferred.append("data_analysis")
-    if any(
+    if re.search(
+        r"\b(?:make|create|generate|draw|design)\b[\s\S]{0,80}"
+        r"\b(?:image|picture|photo|illustration|poster|logo|banner)\b",
+        text,
+    ) or any(
         phrase in text
         for phrase in (
             "generate an image",
             "create an image",
             "make an image",
+            "make me an image",
+            "make me a image",
             "draw an image",
             "design an illustration",
             "create a logo",
@@ -3319,6 +3398,11 @@ def chat_stream():
         "controls or tools do not exist. Voice conversations are available. "
         "Describe only tools that were actually enabled for this "
         "request, and never pretend a tool ran when it did not. When Web "
+        "Image generation status is controlled by the image-generation "
+        "pipeline. Never say an image is generating, rendering, running, or "
+        "will appear shortly unless the image_generation tool is actually "
+        "enabled for this request. When it is not enabled, answer normally "
+        "without inventing background work. When Web "
         "Search is enabled, never claim that Vurenn has no internet access. "
         "If one particular URL is private, expired, or blocks automated "
         "access, explain that the specific link could not be opened and ask "
@@ -3354,14 +3438,81 @@ def chat_stream():
                 yield sse("token", {"text": safe_text})
                 usage_data = {}
             elif image_request:
+                subject = image_request_subject(user_text)
+                research_needed = image_prompt_needs_research(user_text)
+                estimated_seconds = 90 if research_needed else 70
+                estimated_finish_at = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=estimated_seconds)
+                ).isoformat()
                 yield sse(
                     "tool_started",
                     {
                         "tool_call_id": "image_generation",
                         "tool_name": "image_generation",
+                        "subject": subject,
+                        "estimated_seconds": estimated_seconds,
+                        "estimated_finish_at": estimated_finish_at,
                     },
                 )
-                image_url = generate_image(user_text, user_id)
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 0,
+                        "estimated_seconds": estimated_seconds,
+                    },
+                )
+                image_prompt = research_image_prompt(user_text)
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 1,
+                        "estimated_seconds": max(45, estimated_seconds - 15),
+                    },
+                )
+                image_prompt = (
+                    f"{image_prompt}\n\nCreate one polished, original image. "
+                    "Prioritize accurate subject details, natural composition, "
+                    "coherent lighting, and professional finish."
+                )
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 2,
+                        "estimated_seconds": max(35, estimated_seconds - 25),
+                    },
+                )
+                image_bytes = generate_image_bytes(image_prompt)
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 3,
+                        "estimated_seconds": 8,
+                    },
+                )
+                image_url = store_generated_image(user_id, image_bytes)
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 4,
+                        "estimated_seconds": 3,
+                    },
+                )
                 safe_text = (
                     "Here is your generated image.\n\n"
                     f"![Generated image]({image_url})\n\n"

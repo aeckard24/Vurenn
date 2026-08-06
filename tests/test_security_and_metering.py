@@ -126,6 +126,18 @@ class SecurityAndMeteringTests(unittest.TestCase):
             ["deep_research"],
         )
         self.assertEqual(
+            wsgi.infer_requested_tools(
+                "make me a image of a Jeep Cherokee 2019 Trailhawk"
+            ),
+            ["image_generation"],
+        )
+        self.assertEqual(
+            wsgi.image_request_subject(
+                "make me a image of a Jeep Cherokee 2019 Trailhawk"
+            ),
+            "a Jeep Cherokee 2019 Trailhawk",
+        )
+        self.assertEqual(
             wsgi.infer_requested_tools("Explain this", has_attachments=True),
             ["file_analysis"],
         )
