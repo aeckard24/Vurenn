@@ -405,6 +405,14 @@ TOOL_CATALOG = {
     },
 }
 
+# One-time digital items have no recurring provider cost. Prices and fulfillment
+# are authoritative on the server; the browser never supplies either value.
+STORE_ITEMS = {
+    "companion_orbit": {"name": "Orbit companion", "amount_cents": 399, "kind": "companion", "description": "A calm animated orbit that lives in your sidebar."},
+    "companion_sprout": {"name": "Sprout companion", "amount_cents": 299, "kind": "companion", "description": "A tiny growing companion for your workspace."},
+    "focus_pack": {"name": "Focus room pack", "amount_cents": 499, "kind": "utility", "description": "Unlock minimal focus layouts and calm visual timers."},
+}
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -555,6 +563,17 @@ EPISTEMIC_STANDARD_PROMPT = (
     "is missing and the safest way to verify it. Correct the user respectfully "
     "when evidence requires it. Never expose hidden chain-of-thought; provide a "
     "concise explanation, relevant evidence, and clearly labeled uncertainty. "
+)
+
+RESPONSE_CRAFT_PROMPT = (
+    "Write with clean punctuation, complete sentences, and natural transitions. "
+    "Lead with the useful conclusion. Use short paragraphs and descriptive headings "
+    "only when they improve scanning; do not turn every thought into a bold bullet. "
+    "For product or business ideas, pressure-test the problem, evidence, competitors, "
+    "feasibility, regulation or intellectual property when relevant, economics, and the "
+    "cheapest credible next experiment. Avoid canned praise, filler, and choppy fragments. "
+    "When live research is used, place each citation immediately after the sentence or "
+    "claim it supports rather than collecting unsupported links at the end. "
 )
 
 PROJECT_INTELLIGENCE_PROMPT = (
@@ -1429,6 +1448,16 @@ def infer_requested_tools(user_text, has_attachments=False):
             "current price",
             "latest update",
             "what happened today",
+            "business idea",
+            "product idea",
+            "product concept",
+            "market opportunity",
+            "is this a good idea",
+            "would this work",
+            "does this already exist",
+            "existing competitors",
+            "patent landscape",
+            "manufacturing cost",
         )
     ):
         inferred.append("web_search")
@@ -4155,7 +4184,7 @@ def chat_stream():
         "If one particular URL is private, expired, or blocks automated "
         "access, explain that the specific link could not be opened and ask "
         "for a public sharing link or uploaded file instead. "
-        f"{SAFETY_PROMPT} {model['style']} "
+        f"{SAFETY_PROMPT} {RESPONSE_CRAFT_PROMPT} {model['style']} "
         f"{response_preference_prompt(profile.get('response_preferences'))} "
         f"{adaptive_conversation_prompt(previous, recent_user_messages)} "
         + " ".join(tool_system_parts + user_context)
@@ -4308,20 +4337,104 @@ def chat_stream():
                 }
                 if provider_tools:
                     create_kwargs["tools"] = provider_tools
+
+                emitted_source_ids = set()
+                progress_tool = (
+                    "deep_research"
+                    if "deep_research" in requested_tools
+                    else (requested_tools[0] if requested_tools else "file_analysis")
+                )
+
+                def stream_provider_request(request_kwargs, use_files_beta=False):
+                    stream_manager = (
+                        anthropic_client.beta.messages.stream(
+                            **request_kwargs,
+                            betas=["files-api-2025-04-14"],
+                        )
+                        if use_files_beta
+                        else anthropic_client.messages.stream(**request_kwargs)
+                    )
+                    with stream_manager as provider_stream:
+                        for provider_event in provider_stream:
+                            event_type = getattr(provider_event, "type", "")
+                            if event_type == "content_block_start":
+                                block = getattr(provider_event, "content_block", None)
+                                block_data = (
+                                    block.model_dump()
+                                    if hasattr(block, "model_dump")
+                                    else (dict(block) if block else {})
+                                )
+                                if block_data.get("type") != "web_search_tool_result":
+                                    continue
+                                results = block_data.get("content") or []
+                                if not isinstance(results, list):
+                                    continue
+                                for result in results:
+                                    url = result.get("url")
+                                    title = result.get("title") or url
+                                    if not url:
+                                        continue
+                                    source_id = str(url)
+                                    if source_id not in emitted_source_ids:
+                                        emitted_source_ids.add(source_id)
+                                        yield sse(
+                                            "source",
+                                            {"id": source_id, "title": str(title), "url": url},
+                                        )
+                                    try:
+                                        domain = urlparse(url).netloc.replace("www.", "", 1)
+                                    except Exception:
+                                        domain = str(title)
+                                    yield sse(
+                                        "tool_progress",
+                                        {
+                                            "tool_call_id": progress_tool,
+                                            "tool_name": progress_tool,
+                                            "subject": user_text.strip()[:140],
+                                            "stage_index": 1,
+                                            "detail": f"Reviewing {domain}",
+                                        },
+                                    )
+                            elif event_type == "text":
+                                safe_chunk = prepare_reply_text(
+                                    str(getattr(provider_event, "text", "") or "")
+                                )
+                                if safe_chunk:
+                                    full_text.append(safe_chunk)
+                                    yield sse("token", {"text": safe_chunk})
+                            elif event_type == "citation":
+                                citation = getattr(provider_event, "citation", None)
+                                citation_data = (
+                                    citation.model_dump()
+                                    if hasattr(citation, "model_dump")
+                                    else (dict(citation) if citation else {})
+                                )
+                                url = citation_data.get("url")
+                                title = citation_data.get("title") or url
+                                if not url:
+                                    continue
+                                source_id = str(url)
+                                if source_id not in emitted_source_ids:
+                                    emitted_source_ids.add(source_id)
+                                    yield sse(
+                                        "source",
+                                        {"id": source_id, "title": str(title), "url": url},
+                                    )
+                                safe_title = re.sub(r"[\[\]]", "", str(title or "Source"))[:90]
+                                citation_text = f" [{safe_title}]({url})"
+                                full_text.append(citation_text)
+                                yield sse("token", {"text": citation_text})
+                        return provider_stream.get_final_message()
+
                 provider_error = None
                 attempt_models = provider_model_attempts(create_kwargs["model"])
                 for attempt, provider_model in enumerate(attempt_models):
                     create_kwargs["model"] = provider_model
                     try:
-                        if owned_attachments:
-                            final = anthropic_client.beta.messages.create(
-                                **create_kwargs,
-                                betas=["files-api-2025-04-14"],
-                            )
-                        else:
-                            final = anthropic_client.messages.create(
-                                **create_kwargs
-                            )
+                        final = yield from stream_provider_request(
+                            create_kwargs,
+                            use_files_beta=bool(owned_attachments),
+                        )
                         provider_error = None
                         break
                     except Exception as error:
@@ -4345,11 +4458,6 @@ def chat_stream():
                     and continuation_rounds < 5
                 ):
                     continuation_rounds += 1
-                    progress_tool = (
-                        "deep_research"
-                        if "deep_research" in requested_tools
-                        else requested_tools[0]
-                    )
                     yield sse(
                         "tool_progress",
                         {
@@ -4367,15 +4475,10 @@ def chat_stream():
                         **create_kwargs,
                         "messages": continuation_messages,
                     }
-                    if owned_attachments:
-                        final = anthropic_client.beta.messages.create(
-                            **continuation_kwargs,
-                            betas=["files-api-2025-04-14"],
-                        )
-                    else:
-                        final = anthropic_client.messages.create(
-                            **continuation_kwargs
-                        )
+                    final = yield from stream_provider_request(
+                        continuation_kwargs,
+                        use_files_beta=bool(owned_attachments),
+                    )
                     provider_responses.append(final)
 
                 aggregate_tool_use = {}
@@ -4399,33 +4502,6 @@ def chat_stream():
                         ) + int(value or 0)
                 usage_data["server_tool_use"] = aggregate_tool_use
 
-                for block in final.content:
-                    block_data = (
-                        block.model_dump()
-                        if hasattr(block, "model_dump")
-                        else dict(block)
-                    )
-                    if block_data.get("type") != "text":
-                        continue
-                    safe_text = prepare_reply_text(
-                        str(block_data.get("text") or "")
-                    )
-                    if safe_text:
-                        full_text.append(safe_text)
-                        for start in range(0, len(safe_text), 320):
-                            yield sse("token", {"text": safe_text[start : start + 320]})
-                    for citation in block_data.get("citations") or []:
-                        url = citation.get("url")
-                        title = citation.get("title") or citation.get("document_title")
-                        if url or title:
-                            yield sse(
-                                "source",
-                                {
-                                    "id": str(url or title),
-                                    "title": str(title or url),
-                                    "url": url,
-                                },
-                            )
                 for tool_id in requested_tools:
                     yield sse(
                         "tool_completed",
@@ -4854,7 +4930,12 @@ def create_checkout():
     plan_id = str(payload.get("plan_id") or "")
     interval = str(payload.get("interval") or "monthly")
     pack_id = str(payload.get("pack_id") or "")
-    if pack_id:
+    item_id = str(payload.get("item_id") or "")
+    if item_id:
+        catalog_id = item_id
+        expected = STORE_ITEMS.get(catalog_id)
+        checkout_mode = "payment"
+    elif pack_id:
         catalog_id = pack_id
         expected = CREDIT_PACKS.get(catalog_id)
         checkout_mode = "payment"
@@ -4865,33 +4946,29 @@ def create_checkout():
     price_id = STRIPE_PRICES.get(catalog_id, "")
     if not expected:
         return api_error(422, "invalid_checkout_item", "Unknown checkout item.")
-    if not STRIPE_SECRET_KEY or not price_id:
+    if not STRIPE_SECRET_KEY or (not price_id and not item_id):
         return api_error(503, "billing_not_configured", "Billing is unavailable.")
-    price = stripe.Price.retrieve(price_id)
-    valid = (
-        price.get("active")
-        and price.get("currency") == "usd"
-        and price.get("unit_amount") == expected["amount_cents"]
-    )
-    if checkout_mode == "subscription":
-        valid = valid and (price.get("recurring") or {}).get(
-            "interval"
-        ) == expected["interval"]
-    else:
-        valid = valid and not price.get("recurring")
-    if not valid:
-        return api_error(
-            409,
-            "billing_price_mismatch",
-            "Checkout is paused because the configured Stripe price does not "
-            "match Vurenn's displayed catalog.",
+    if not item_id:
+        price = stripe.Price.retrieve(price_id)
+        valid = (
+            price.get("active")
+            and price.get("currency") == "usd"
+            and price.get("unit_amount") == expected["amount_cents"]
         )
+        if checkout_mode == "subscription":
+            valid = valid and (price.get("recurring") or {}).get("interval") == expected["interval"]
+        else:
+            valid = valid and not price.get("recurring")
+        if not valid:
+            return api_error(409, "billing_price_mismatch", "Checkout is paused because the configured Stripe price does not match Vurenn's displayed catalog.")
     metadata = {
         "user_id": g.user_id,
-        "purchase_type": "credits" if pack_id else "subscription",
+        "purchase_type": "store" if item_id else ("credits" if pack_id else "subscription"),
         "catalog_id": catalog_id,
     }
-    if pack_id:
+    if item_id:
+        metadata.update({"item_id": item_id, "amount_cents": str(expected["amount_cents"])})
+    elif pack_id:
         metadata.update(
             {
                 "pack_id": pack_id,
@@ -4903,10 +4980,10 @@ def create_checkout():
         metadata["plan_id"] = expected["plan_id"]
     session_kwargs = {
         "mode": checkout_mode,
-        "line_items": [{"price": price_id, "quantity": 1}],
+        "line_items": ([{"price": price_id, "quantity": 1}] if price_id else [{"price_data": {"currency": "usd", "unit_amount": expected["amount_cents"], "product_data": {"name": f"Vurenn — {expected['name']}", "description": expected["description"]}}, "quantity": 1}]),
         "customer_email": g.user.get("email"),
-        "success_url": f"{FRONTEND_URL}/pricing?checkout=success",
-        "cancel_url": f"{FRONTEND_URL}/pricing?checkout=canceled",
+        "success_url": f"{FRONTEND_URL}/{'store' if item_id else 'pricing'}?checkout=success",
+        "cancel_url": f"{FRONTEND_URL}/{'store' if item_id else 'pricing'}?checkout=canceled",
         "allow_promotion_codes": True,
         "metadata": metadata,
     }
@@ -4916,6 +4993,37 @@ def create_checkout():
         **session_kwargs,
     )
     return jsonify({"url": session.url})
+
+
+def user_store_state(user_id):
+    value = app_setting_value(f"store_user_{user_id}", {"owned": [], "active_companion": None})
+    return value if isinstance(value, dict) else {"owned": [], "active_companion": None}
+
+
+@app.route("/v1/store", methods=["GET", "OPTIONS"])
+@auth_required
+def get_store():
+    state = user_store_state(g.user_id)
+    return jsonify({
+        "items": [{"id": item_id, **item} for item_id, item in STORE_ITEMS.items()],
+        "owned": state.get("owned", []),
+        "active_companion": state.get("active_companion"),
+    })
+
+
+@app.route("/v1/store/activate", methods=["POST", "OPTIONS"])
+@auth_required
+def activate_store_item():
+    item_id = str((request.get_json(silent=True) or {}).get("item_id") or "")
+    item = STORE_ITEMS.get(item_id)
+    state = user_store_state(g.user_id)
+    if not item or item_id not in state.get("owned", []):
+        return api_error(403, "store_item_not_owned", "Purchase this item before activating it.")
+    if item["kind"] != "companion":
+        return api_error(422, "store_item_not_activatable", "This item does not need activation.")
+    state["active_companion"] = item_id
+    save_app_setting(f"store_user_{g.user_id}", state, g.user_id)
+    return jsonify({"active_companion": item_id})
 
 
 def upsert_subscription(user_id, values):
@@ -4955,7 +5063,17 @@ def stripe_webhook():
     }:
         metadata = data.get("metadata", {})
         user_id = metadata.get("user_id")
-        if user_id and metadata.get("purchase_type") == "credits":
+        if user_id and metadata.get("purchase_type") == "store":
+            item_id = metadata.get("item_id")
+            item = STORE_ITEMS.get(item_id)
+            if item and data.get("payment_status") in {"paid", "no_payment_required"}:
+                state = user_store_state(user_id)
+                owned = list(dict.fromkeys([*state.get("owned", []), item_id]))
+                state["owned"] = owned
+                if item["kind"] == "companion" and not state.get("active_companion"):
+                    state["active_companion"] = item_id
+                save_app_setting(f"store_user_{user_id}", state, user_id)
+        elif user_id and metadata.get("purchase_type") == "credits":
             pack_id = metadata.get("pack_id")
             pack = CREDIT_PACKS.get(pack_id)
             if pack and data.get("payment_status") in {"paid", "no_payment_required"}:

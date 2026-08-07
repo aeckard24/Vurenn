@@ -284,6 +284,12 @@ class SecurityAndMeteringTests(unittest.TestCase):
             [],
         )
         self.assertEqual(
+            wsgi.infer_requested_tools(
+                "I have a product concept for a coffee bitterness packet. Would this work?"
+            ),
+            ["web_search"],
+        )
+        self.assertEqual(
             wsgi.infer_requested_tools("Deep research this market for me"),
             ["deep_research"],
         )
