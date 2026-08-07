@@ -2907,6 +2907,7 @@ def legal_consent():
     payload = request.get_json(silent=True) or {}
     version = str(payload.get("policy_version") or "").strip()
     accepted_at = str(payload.get("accepted_at") or "").strip()
+    age_confirmed = payload.get("age_confirmed") is True
     acceptance_method = str(payload.get("acceptance_method") or "policy_update").strip()
     accepted_all = all(
         payload.get(field) is True
@@ -2921,6 +2922,12 @@ def legal_consent():
             422,
             "legal_consent_required",
             "Accept the current Terms, Privacy Policy, and Acceptable Use Policy.",
+        )
+    if not age_confirmed:
+        return api_error(
+            422,
+            "adult_confirmation_required",
+            "Confirm that you are at least 18 to continue.",
         )
     if acceptance_method not in {"oauth_signup", "policy_update"}:
         return api_error(422, "invalid_consent_method", "That consent method is invalid.")
