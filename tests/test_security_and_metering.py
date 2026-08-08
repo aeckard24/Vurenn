@@ -298,6 +298,12 @@ class SecurityAndMeteringTests(unittest.TestCase):
         )
         self.assertEqual(
             wsgi.infer_requested_tools(
+                "Tell me exactly what buttons to click to fix it."
+            ),
+            ["web_search"],
+        )
+        self.assertEqual(
+            wsgi.infer_requested_tools(
                 "I have a product concept for a coffee bitterness packet. Would this work?"
             ),
             ["web_search"],
@@ -333,6 +339,13 @@ class SecurityAndMeteringTests(unittest.TestCase):
             ),
             ["web_search", "data_analysis"],
         )
+
+    def test_tool_stream_reads_raw_text_deltas_and_final_text(self):
+        event = Mock(type="content_block_delta")
+        event.delta = Mock(type="text_delta", text="Recovered live text")
+        self.assertEqual(wsgi.provider_event_text(event), "Recovered live text")
+        message = Mock(content=[Mock(type="text", text="Final answer")])
+        self.assertEqual(wsgi.provider_message_text(message), "Final answer")
 
     def test_only_approved_email_is_a_team_member(self):
         approved = next(iter(wsgi.TEAM_EMAILS))

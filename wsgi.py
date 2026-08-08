@@ -1558,6 +1558,30 @@ def build_research_plan(topic):
         return fallback
 
 
+def provider_event_text(provider_event):
+    """Return text from both SDK helper events and raw Messages API deltas."""
+    event_type = str(getattr(provider_event, "type", "") or "")
+    if event_type == "text":
+        return str(getattr(provider_event, "text", "") or "")
+    if event_type != "content_block_delta":
+        return ""
+    delta = getattr(provider_event, "delta", None)
+    delta_type = str(getattr(delta, "type", "") or "")
+    if delta_type != "text_delta":
+        return ""
+    return str(getattr(delta, "text", "") or "")
+
+
+def provider_message_text(message):
+    """Recover final text when a provider stream did not expose text deltas."""
+    chunks = []
+    for block in getattr(message, "content", []) or []:
+        block_type = str(getattr(block, "type", "") or "")
+        if block_type == "text":
+            chunks.append(str(getattr(block, "text", "") or ""))
+    return "".join(chunks)
+
+
 _ALWAYS_LIVE_PATTERNS = (
     r"\b(?:weather|forecast|temperature|radar|air quality|uv index|snowfall|rainfall)\b",
     r"\b(?:breaking news|latest news|news today|headlines?)\b",
@@ -1586,6 +1610,13 @@ def current_information_requires_web(user_text):
     if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in _ALWAYS_LIVE_PATTERNS):
         return True
     if _LIVE_TIME_WORDS.search(text) and _CHANGEABLE_TOPICS.search(text):
+        return True
+    if re.search(
+        r"\b(?:troubleshoot|diagnose|steps? to fix|how (?:do i|can i|to) fix|"
+        r"exactly what buttons?|error code|stopped working|used to work|not working)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
         return True
     return bool(
         re.search(
@@ -4448,6 +4479,7 @@ def chat_stream():
                 )
 
                 def stream_provider_request(request_kwargs, use_files_beta=False):
+                    emitted_text = False
                     stream_manager = (
                         anthropic_client.beta.messages.stream(
                             **request_kwargs,
@@ -4497,36 +4529,26 @@ def chat_stream():
                                             "detail": f"Reviewing {domain}",
                                         },
                                     )
-                            elif event_type == "text":
+                            else:
+                                raw_chunk = provider_event_text(provider_event)
+                                if not raw_chunk:
+                                    continue
                                 safe_chunk = prepare_reply_text(
-                                    str(getattr(provider_event, "text", "") or "")
+                                    raw_chunk
                                 )
                                 if safe_chunk:
+                                    emitted_text = True
                                     full_text.append(safe_chunk)
                                     yield sse("token", {"text": safe_chunk})
-                            elif event_type == "citation":
-                                citation = getattr(provider_event, "citation", None)
-                                citation_data = (
-                                    citation.model_dump()
-                                    if hasattr(citation, "model_dump")
-                                    else (dict(citation) if citation else {})
-                                )
-                                url = citation_data.get("url")
-                                title = citation_data.get("title") or url
-                                if not url:
-                                    continue
-                                source_id = str(url)
-                                if source_id not in emitted_source_ids:
-                                    emitted_source_ids.add(source_id)
-                                    yield sse(
-                                        "source",
-                                        {"id": source_id, "title": str(title), "url": url},
-                                    )
-                                safe_title = re.sub(r"[\[\]]", "", str(title or "Source"))[:90]
-                                citation_text = f" [{safe_title}]({url})"
-                                full_text.append(citation_text)
-                                yield sse("token", {"text": citation_text})
-                        return provider_stream.get_final_message()
+                        final_message = provider_stream.get_final_message()
+                        if not emitted_text:
+                            recovered_text = prepare_reply_text(
+                                provider_message_text(final_message)
+                            )
+                            if recovered_text:
+                                full_text.append(recovered_text)
+                                yield sse("token", {"text": recovered_text})
+                        return final_message
 
                 provider_error = None
                 attempt_models = provider_model_attempts(create_kwargs["model"])
@@ -4694,6 +4716,8 @@ def chat_stream():
                 "server_tool_use": usage_data.get("server_tool_use") or {},
             }
             answer = "".join(full_text)
+            if not answer.strip():
+                raise RuntimeError("EMPTY_PROVIDER_RESPONSE")
             final_cost = credits_for_usage(
                 model,
                 usage["input_tokens"],
