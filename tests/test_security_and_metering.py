@@ -347,6 +347,19 @@ class SecurityAndMeteringTests(unittest.TestCase):
         message = Mock(content=[Mock(type="text", text="Final answer")])
         self.assertEqual(wsgi.provider_message_text(message), "Final answer")
 
+    def test_history_window_keeps_recent_context_with_mode_limits(self):
+        history = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 2_000}
+            for index in range(50)
+        ]
+        fast = wsgi.trim_conversation_history(history, "vurenn-fast")
+        balanced = wsgi.trim_conversation_history(history, "vurenn")
+        maximum = wsgi.trim_conversation_history(history, "vurenn-max")
+        self.assertLessEqual(sum(len(item["content"]) for item in fast), 14_000)
+        self.assertLessEqual(len(fast), 14)
+        self.assertGreater(len(balanced), len(fast))
+        self.assertGreater(len(maximum), len(balanced))
+
     def test_only_approved_email_is_a_team_member(self):
         approved = next(iter(wsgi.TEAM_EMAILS))
         self.assertTrue(wsgi.is_team({"email": approved}))

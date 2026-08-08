@@ -27,6 +27,7 @@ import stripe
 from anthropic import Anthropic
 from flask import Flask, Response, g, jsonify, request
 from PIL import Image
+from requests.adapters import HTTPAdapter
 from stripe._error import SignatureVerificationError
 from werkzeug.exceptions import HTTPException
 
@@ -44,6 +45,12 @@ ANTHROPIC_MODEL = os.environ.get(
 )
 ANTHROPIC_PREMIUM_MODEL = os.environ.get(
     "ANTHROPIC_PREMIUM_MODEL", "claude-opus-5"
+)
+
+SUPABASE_HTTP = requests.Session()
+SUPABASE_HTTP.mount(
+    "https://",
+    HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0),
 )
 OPENAI_IMAGE_API_KEY = os.environ.get("OPENAI_IMAGE_API_KEY", "")
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
@@ -958,7 +965,7 @@ def supabase_request(method, path, *, params=None, body=None, prefer=None):
     }
     if prefer:
         headers["Prefer"] = prefer
-    response = requests.request(
+    response = SUPABASE_HTTP.request(
         method,
         f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}",
         params=params,
@@ -1654,6 +1661,31 @@ def adaptive_conversation_prompt(history, recent_user_messages=None):
         instructions.append("The user is correcting a failure: acknowledge it once, fix it directly, and avoid defensiveness or repeated instructions.")
     instructions.append("Resolve pronouns and follow-ups from the current conversation instead of treating every turn as a new topic.")
     return " ".join(instructions)
+
+
+def trim_conversation_history(history, model_id):
+    """Keep recent context useful without making every turn reprocess a huge chat."""
+    limits = {
+        "vurenn-fast": (14, 14_000),
+        "vurenn": (24, 28_000),
+        "vurenn-max": (40, 60_000),
+    }
+    message_limit, character_limit = limits.get(model_id, limits["vurenn"])
+    selected = []
+    used_characters = 0
+    for item in reversed(list(history or [])):
+        content = str(item.get("content") or "")
+        if not content:
+            continue
+        remaining = character_limit - used_characters
+        if remaining <= 0 or len(selected) >= message_limit:
+            break
+        if len(content) > remaining:
+            content = content[-remaining:]
+        selected.append({**item, "content": content})
+        used_characters += len(content)
+    selected.reverse()
+    return selected
 
 
 _SAFE_BINARY_OPERATORS = {
@@ -4020,12 +4052,13 @@ def chat_stream():
             "user_id": f"eq.{g.user_id}",
             "role": "in.(user,assistant)",
             "order": "created_at.desc",
-            "limit": "60",
+            "limit": "40",
         },
     ) or []
     # The database returns newest-first so the capped window contains the latest
     # context; model messages still need chronological order.
     previous.reverse()
+    previous = trim_conversation_history(previous, model_id)
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
     now = utc_now()
@@ -4226,17 +4259,6 @@ def chat_stream():
         },
     ) or []
     profile = profile_rows[0] if profile_rows else {}
-    recent_user_messages = supabase_request(
-        "GET",
-        "messages",
-        params={
-            "select": "role,content",
-            "user_id": f"eq.{g.user_id}",
-            "role": "eq.user",
-            "order": "created_at.desc",
-            "limit": "24",
-        },
-    ) or []
     user_context = []
     project = (
         get_owned_project(conversation.get("project_id"), g.user_id)
@@ -4319,7 +4341,7 @@ def chat_stream():
         "for a public sharing link or uploaded file instead. "
         f"{SAFETY_PROMPT} {RESPONSE_CRAFT_PROMPT} {model['style']} "
         f"{response_preference_prompt(profile.get('response_preferences'))} "
-        f"{adaptive_conversation_prompt(previous, recent_user_messages)} "
+        f"{adaptive_conversation_prompt(previous)} "
         + " ".join(tool_system_parts + user_context)
     )
     if voice_mode:
@@ -4657,7 +4679,7 @@ def chat_stream():
                             for text in response_stream.text_stream:
                                 pending_text += text
                                 stream_chunk_size = (
-                                    36 if voice_mode else 120
+                                    12 if voice_mode else 18
                                 )
                                 if len(pending_text) > stream_chunk_size:
                                     cutoff = max(
@@ -4665,7 +4687,7 @@ def chat_stream():
                                             char,
                                             0,
                                             len(pending_text)
-                                            - (12 if voice_mode else 32),
+                                            - (4 if voice_mode else 6),
                                         )
                                         for char in (" ", "\n", "\t")
                                     )
