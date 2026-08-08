@@ -61,7 +61,7 @@ OPENAI_IMAGE_TIMEOUT_SECONDS = int(
 )
 OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "")
 OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "tts-1-hd")
-LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-06")
+LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-08")
 GENERATED_IMAGE_BUCKET = os.environ.get(
     "GENERATED_IMAGE_BUCKET", "vurenn-generated-images"
 )
@@ -871,14 +871,29 @@ def safety_category(value):
 
 
 def record_abuse_event(user_id, category, content):
-    """Store a privacy-minimized safety event without retaining the prompt."""
+    """Preserve a restricted safety record with a defined retention deadline."""
     try:
         secret = GENERATED_IMAGE_SIGNING_SECRET or SUPABASE_SERVICE_ROLE_KEY
+        raw_content = str(content or "")[:MAX_MESSAGE_CHARS]
         digest = hmac.new(
             secret.encode("utf-8"),
-            str(content).encode("utf-8"),
+            raw_content.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        forwarded = str(request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        remote_address = forwarded or str(request.remote_addr or "unknown")
+        ip_hash = hmac.new(
+            secret.encode("utf-8"),
+            remote_address.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+        supabase_request(
+            "DELETE",
+            "abuse_events",
+            params={"expires_at": f"lt.{utc_now()}"},
+            prefer="return=minimal",
+        )
         supabase_request(
             "POST",
             "abuse_events",
@@ -887,6 +902,10 @@ def record_abuse_event(user_id, category, content):
                 "category": str(category)[:80],
                 "content_hash": digest,
                 "request_id": getattr(g, "request_id", None),
+                "content": raw_content,
+                "ip_hash": ip_hash,
+                "user_agent": str(request.headers.get("User-Agent") or "")[:500],
+                "expires_at": expires_at,
             },
             prefer="return=minimal",
         )
@@ -2757,6 +2776,52 @@ def admin_dashboard():
     )
 
 
+@app.route("/v1/admin/security-events", methods=["GET", "OPTIONS"])
+@admin_required
+def admin_security_events():
+    """Return restricted, short-lived safety records to the CEO admin."""
+    user_response = requests.get(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        params={"page": 1, "per_page": 1000},
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+        timeout=15,
+    )
+    if user_response.status_code >= 400:
+        raise RuntimeError("Could not load Supabase users.")
+    email_by_id = {
+        str(item.get("id")): item.get("email")
+        for item in user_response.json().get("users", [])
+    }
+    rows = supabase_request(
+        "GET",
+        "abuse_events",
+        params={
+            "select": (
+                "id,user_id,category,content,request_id,ip_hash,user_agent,"
+                "created_at,expires_at"
+            ),
+            "order": "created_at.desc",
+            "limit": "200",
+        },
+    ) or []
+    return jsonify(
+        {
+            "events": [
+                {**row, "email": email_by_id.get(str(row.get("user_id")))}
+                for row in rows
+            ],
+            "retention_days": 90,
+            "notice": (
+                "Safety flags are review leads, not proof. Preserve or disclose "
+                "records only for a valid safety, legal, or dispute need."
+            ),
+        }
+    )
+
+
 @app.route("/v1/admin/config", methods=["GET", "OPTIONS"])
 @admin_required
 def admin_config():
@@ -3067,8 +3132,8 @@ def legal_consent():
     if not age_confirmed:
         return api_error(
             422,
-            "adult_confirmation_required",
-            "Confirm that you are at least 18 to continue.",
+            "age_eligibility_required",
+            "Confirm that you meet Vurenn's age and parent-or-guardian permission requirements.",
         )
     if acceptance_method not in {"oauth_signup", "policy_update"}:
         return api_error(422, "invalid_consent_method", "That consent method is invalid.")
@@ -4010,8 +4075,9 @@ def chat_stream():
             f"Messages are limited to {MAX_MESSAGE_CHARS:,} characters.",
         )
     category = safety_category(user_text)
-    if category in {"violent_instruction", "unsafe_robotics"}:
+    if category:
         record_abuse_event(g.user_id, category, user_text)
+    if category in {"violent_instruction", "unsafe_robotics"}:
         return api_error(
             422,
             "unsafe_request",
@@ -4880,6 +4946,8 @@ def developer_chat():
     local_answer = local_utility_response(user_text)
 
     category = safety_category(user_text)
+    if category:
+        record_abuse_event(g.user_id, category, user_text)
     if category == "self_harm":
         return jsonify(
             {
@@ -4897,7 +4965,6 @@ def developer_chat():
             }
         )
     if category in {"violent_instruction", "unsafe_robotics"}:
-        record_abuse_event(g.user_id, category, user_text)
         return api_error(
             422,
             "unsafe_request",

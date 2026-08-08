@@ -65,7 +65,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
             wsgi.LEGAL_POLICY_VERSION,
         )
 
-    def test_legal_consent_rejects_missing_adult_confirmation(self):
+    def test_legal_consent_rejects_missing_age_eligibility_confirmation(self):
         user_id = "11111111-1111-1111-1111-111111111111"
         with patch.object(
             wsgi, "authenticate", return_value={"id": user_id, "email": "user@example.com"}
@@ -83,7 +83,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
                 headers={"Authorization": "Bearer test-token"},
             )
         self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.get_json()["code"], "adult_confirmation_required")
+        self.assertEqual(response.get_json()["code"], "age_eligibility_required")
 
     def test_generated_image_links_are_signed(self):
         with patch.object(wsgi, "GENERATED_IMAGE_SIGNING_SECRET", "test-secret"):

@@ -68,8 +68,16 @@ create table if not exists public.abuse_events (
   category text not null check (char_length(category) between 1 and 80),
   content_hash text not null check (char_length(content_hash) = 64),
   request_id text,
+  content text not null default '',
+  ip_hash text,
+  user_agent text,
+  expires_at timestamptz not null default (now() + interval '90 days'),
   created_at timestamptz not null default now()
 );
+alter table public.abuse_events add column if not exists content text not null default '';
+alter table public.abuse_events add column if not exists ip_hash text;
+alter table public.abuse_events add column if not exists user_agent text;
+alter table public.abuse_events add column if not exists expires_at timestamptz not null default (now() + interval '90 days');
 create index if not exists abuse_events_user_created_idx
   on public.abuse_events (user_id, created_at desc);
 alter table public.abuse_events enable row level security;
