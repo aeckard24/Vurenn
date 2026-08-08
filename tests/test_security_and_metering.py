@@ -36,6 +36,24 @@ class SecurityAndMeteringTests(unittest.TestCase):
         with patch.object(wsgi, "has_private_beta_access", return_value=True):
             self.assertTrue(wsgi.can_bypass_maintenance(user, user["id"]))
 
+    def test_authenticated_user_without_invite_is_blocked_during_private_beta(self):
+        user = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "uninvited@example.com",
+        }
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=True
+        ), patch.object(wsgi, "can_bypass_maintenance", return_value=False):
+            response = wsgi.app.test_client().get(
+                "/v1/credits",
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.get_json()["code"],
+            "private_beta_invite_required",
+        )
+
     def test_current_legal_consent_is_versioned_and_recorded_privately(self):
         user_id = "11111111-1111-1111-1111-111111111111"
         payload = {

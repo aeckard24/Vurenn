@@ -2223,6 +2223,22 @@ def auth_required(handler):
             )
         g.user = user
         g.user_id = user["id"]
+        invite_gate_routes = {
+            "/v1/invites/redeem",
+            "/v1/maintenance/access",
+            "/v1/legal/consent",
+            "/v1/profile",
+        }
+        if (
+            construction_mode_enabled()
+            and request.path not in invite_gate_routes
+            and not can_bypass_maintenance(user, user["id"])
+        ):
+            return api_error(
+                403,
+                "private_beta_invite_required",
+                "Vurenn is invite only. Open a valid invitation link to continue.",
+            )
         return handler(*args, **kwargs)
 
     return wrapped
