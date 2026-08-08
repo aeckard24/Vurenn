@@ -465,6 +465,31 @@ DEFAULT_JOURNAL_CONTENT = {
     ),
     "updates": [
         {
+            "date": "August 8, 2026",
+            "category": "Company",
+            "title": "Vurenn private beta opens August 9",
+            "summary": (
+                "Vurenn opens by personal invitation on Sunday, August 9 at "
+                "12:00 PM Eastern. This first release is intentionally small so "
+                "the team can support every invited member, study real usage, "
+                "and improve carefully before a broader launch. Invitation "
+                "requests can be sent to access@vurenn.com."
+            ),
+        },
+        {
+            "date": "August 8, 2026",
+            "category": "Trust & Safety",
+            "title": "Launch safeguards and consent records are ready",
+            "summary": (
+                "Vurenn now saves policy acceptance once per version, clearly "
+                "supports users ages 13-17 with parent or guardian permission, "
+                "blocks dangerous instruction requests, and gives the CEO a "
+                "restricted safety-review trail. Safety records expire after 90 "
+                "days unless preservation is legitimately required; passwords "
+                "are never exposed to administrators."
+            ),
+        },
+        {
             "date": "August 6, 2026",
             "category": "Vurenn Labs",
             "title": "The 50-feature Intelligence Program is live",
@@ -510,7 +535,7 @@ DEFAULT_JOURNAL_CONTENT = {
             "note": "Product direction, company strategy, frontend development, and financial oversight.",
         },
         {
-            "name": "Andrew",
+            "name": "Andrew Eckard",
             "role": "Coder",
             "note": "Backend engineering, infrastructure, and the systems that power Vurenn.",
         },
@@ -694,12 +719,17 @@ def journal_content():
         ) or []
         if rows:
             content = normalize_journal_content(rows[0].get("value"))
-            launch_update = DEFAULT_JOURNAL_CONTENT["updates"][0]
-            if not any(
-                item.get("title") == launch_update["title"]
-                for item in content["updates"]
-            ):
-                content["updates"] = [dict(launch_update), *content["updates"]][:12]
+            required_updates = DEFAULT_JOURNAL_CONTENT["updates"][:2]
+            existing_titles = {item.get("title") for item in content["updates"]}
+            missing_updates = [
+                dict(item)
+                for item in required_updates
+                if item.get("title") not in existing_titles
+            ]
+            content["updates"] = [*missing_updates, *content["updates"]][:12]
+            for person in content["team"]:
+                if person.get("name") == "Andrew":
+                    person["name"] = "Andrew Eckard"
             return content
     except Exception:
         app.logger.exception("Could not read journal content")
