@@ -1384,6 +1384,15 @@ def credits_for_usage(
     )
 
 
+def voice_credits_for_text(text, using_openai=True):
+    if not using_openai:
+        return 5
+    # OpenAI tts-1-hd is $30 per million characters. Add a small delivery and
+    # infrastructure allowance, then use the same conservative credit budget.
+    estimated_cost = len(str(text or "")) * 0.00003 + 0.002
+    return max(5, math.ceil(estimated_cost / COST_BUDGET_PER_CREDIT_USD))
+
+
 def selected_tool_configuration(tool_ids):
     provider_tools = []
     system_parts = []
@@ -1503,6 +1512,50 @@ def infer_requested_tools(user_text, has_attachments=False):
     if has_attachments:
         inferred.append("file_analysis")
     return list(dict.fromkeys(inferred))
+
+
+def build_research_plan(topic):
+    fallback = {
+        "title": "Research plan",
+        "steps": [
+            "Establish the decision, audience, definitions, and boundaries that matter",
+            "Identify the strongest primary sources and current authoritative evidence",
+            "Compare competing explanations, incentives, and meaningful disagreements",
+            "Test dates, assumptions, missing evidence, and likely failure points",
+            "Synthesize the findings into a cited answer with uncertainty and next actions",
+        ],
+    }
+    if not anthropic_client:
+        return fallback
+    try:
+        response = anthropic_client.messages.create(
+            model=MODEL_CATALOG["vurenn-fast"]["provider_model"],
+            max_tokens=650,
+            system=(
+                "Design a specific deep-research plan for the user's exact request. "
+                "Infer what evidence domains, source types, comparisons, and decisions "
+                "actually matter. Do not merely paste the request after generic verbs. "
+                "Return JSON only with a concise title and exactly five concrete steps: "
+                '{"title":"...","steps":["...","...","...","...","..."]}. '
+                "Each step must be one sentence, visibly personalized, and under 150 characters."
+            ),
+            messages=[{"role": "user", "content": str(topic)[:4000]}],
+        )
+        raw = "".join(
+            str(getattr(block, "text", "") or "")
+            for block in response.content
+            if getattr(block, "type", "") == "text"
+        ).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+        parsed = json.loads(raw)
+        title = str(parsed.get("title") or "Research plan").strip()[:100]
+        steps = [str(step).strip()[:180] for step in parsed.get("steps", []) if str(step).strip()]
+        if len(steps) != 5:
+            return fallback
+        return {"title": title, "steps": steps}
+    except Exception:
+        app.logger.exception("Could not generate a personalized research plan")
+        return fallback
 
 
 _ALWAYS_LIVE_PATTERNS = (
@@ -2915,10 +2968,6 @@ def profile():
         values["response_preferences"] = normalize_response_preferences(
             values["response_preferences"]
         )
-        if user_plan(g.user, g.user_id) == "free":
-            values["response_preferences"]["appearance"] = dict(
-                DEFAULT_RESPONSE_PREFERENCES["appearance"]
-            )
     values["updated_at"] = utc_now()
     updated = supabase_request(
         "PATCH",
@@ -3093,7 +3142,7 @@ def voice_config():
                 {"id": voice_id, **details}
                 for voice_id, details in TTS_VOICES.items()
             ],
-            "credit_cost": USAGE_COSTS["voice_turn"]["credits"],
+            "credit_cost": voice_credits_for_text("", bool(OPENAI_VOICE_API_KEY)),
             "privacy": (
                 "Speech input is transcribed by the browser. Completed replies "
                 "may be sent to Vurenn's configured speech provider to create "
@@ -3164,14 +3213,41 @@ def voice_synthesize():
     text = clean_spoken_text(rows[0].get("content"))
     if not text:
         return api_error(422, "empty_voice_reply", "There is no reply to speak.")
+    using_openai = bool(OPENAI_VOICE_API_KEY)
+    metered = user_plan(g.user, g.user_id) == "free"
+    voice_cost = voice_credits_for_text(text, using_openai)
+    voice_request_key = str(request.headers.get("X-Idempotency-Key") or uuid.uuid4())[:160]
+    if metered:
+        try:
+            spend_credits(
+                g.user_id,
+                voice_cost,
+                "voice_synthesis",
+                f"voice:{g.user_id}:{voice_request_key}",
+                {"characters": len(text), "provider": "openai" if using_openai else "vurenn"},
+            )
+        except RuntimeError as error:
+            if "INSUFFICIENT_CREDITS" in str(error):
+                return api_error(402, "insufficient_credits", "You need more Vurenn credits for this spoken reply.")
+            raise
     try:
-        using_openai = bool(OPENAI_VOICE_API_KEY)
         audio = (
             synthesize_openai_speech(text, voice_id)
             if using_openai
             else synthesize_wav(text, voice_id)
         )
     except Exception:
+        if metered:
+            try:
+                refund_credits(
+                    g.user_id,
+                    voice_cost,
+                    "voice_synthesis",
+                    f"refund:voice:{g.user_id}:{voice_request_key}",
+                    {"reason": "synthesis_failed"},
+                )
+            except Exception:
+                app.logger.exception("Could not refund failed voice synthesis")
         app.logger.exception("Neural voice synthesis failed")
         return api_error(
             503,
@@ -3192,6 +3268,7 @@ def voice_synthesize():
             "X-Voice-Engine": (
                 "openai-neural" if using_openai else "vurenn-neural"
             ),
+            "X-Vurenn-Credits-Used": str(voice_cost if metered else 0),
         },
     )
 
@@ -3779,6 +3856,17 @@ def sse(event_type, data):
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+@app.route("/v1/research/plan", methods=["POST", "OPTIONS"])
+@auth_required
+def research_plan():
+    if chat_rate_limited(g.user_id):
+        return api_error(429, "research_plan_rate_limited", "Wait a moment before creating another research plan.")
+    topic = str((request.get_json(silent=True) or {}).get("topic") or "").strip()
+    if not topic or len(topic) > MAX_MESSAGE_CHARS:
+        return api_error(422, "invalid_research_topic", "Describe what you want Vurenn to research.")
+    return jsonify(build_research_plan(topic))
+
+
 @app.route("/v1/chat/stream", methods=["POST", "OPTIONS"])
 @auth_required
 def chat_stream():
@@ -4152,6 +4240,20 @@ def chat_stream():
         credit_context = (
             f"This account currently has {account['balance']} Vurenn credits."
         )
+    active_tool_labels = [
+        USAGE_COSTS.get(tool_id, {}).get("label", tool_id.replace("_", " "))
+        for tool_id in requested_tools
+    ]
+    interface_state = (
+        "Tools active for this turn: " + ", ".join(active_tool_labels) + "."
+        if active_tool_labels
+        else (
+            "No special tool is active yet for this turn. The tools still exist; "
+            "say that a tool is available but not active rather than claiming Vurenn "
+            "cannot perform that kind of task. If the request clearly needs a tool, "
+            "use automatic routing instead of asking the user to toggle it."
+        )
+    )
     system_prompt = (
         f"{CORE_IDENTITY_PROMPT} {EPISTEMIC_STANDARD_PROMPT} Never identify yourself as "
         "Claude, Anthropic, or any underlying provider or model, even if "
@@ -4170,8 +4272,8 @@ def chat_stream():
         "select an appropriate tool automatically when the user's request "
         "clearly requires it, so do not incorrectly tell the user that these "
         "controls or tools do not exist. Voice conversations are available. "
-        "Describe only tools that were actually enabled for this "
-        "request, and never pretend a tool ran when it did not. "
+        "Never pretend a tool ran when it did not. "
+        f"{interface_state} "
         "Image generation status is controlled by the image-generation "
         "pipeline. Never say an image is generating, rendering, running, or "
         "will appear shortly unless the image_generation tool is actually "

@@ -239,6 +239,19 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(wsgi.CREDIT_PACKS["credits_50"]["credits"], 5_000)
         self.assertEqual(wsgi.CREDIT_PACKS["credits_100"]["credits"], 10_000)
 
+    def test_voice_credits_scale_with_provider_usage(self):
+        short = wsgi.voice_credits_for_text("Hello", using_openai=True)
+        long = wsgi.voice_credits_for_text("A" * 4_000, using_openai=True)
+        self.assertGreater(long, short)
+        self.assertGreaterEqual(short, 5)
+        self.assertEqual(wsgi.voice_credits_for_text("Hello", using_openai=False), 5)
+
+    def test_research_plan_has_five_useful_fallback_steps(self):
+        with patch.object(wsgi, "anthropic_client", None):
+            plan = wsgi.build_research_plan("Compare family electric SUVs")
+        self.assertEqual(len(plan["steps"]), 5)
+        self.assertTrue(plan["title"])
+
     def test_research_tools_are_connected(self):
         provider_tools, _, feature_ids = wsgi.selected_tool_configuration(
             ["web_search", "deep_research", "data_analysis"]
