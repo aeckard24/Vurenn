@@ -114,4 +114,3 @@ grant update (
   response_preferences, onboarding_completed, onboarding_skipped,
   security_prompt_dismissed, camera_unlock_enabled, updated_at
 ) on public.profiles to authenticated;
-
