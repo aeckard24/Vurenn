@@ -69,9 +69,6 @@ GENERATED_IMAGE_SIGNING_SECRET = os.environ.get(
     "GENERATED_IMAGE_SIGNING_SECRET", ""
 )
 PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "").rstrip("/")
-PRIVATE_BETA_ACCESS_CODE_HASH = os.environ.get(
-    "PRIVATE_BETA_ACCESS_CODE_HASH", ""
-).strip().lower()
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 STRIPE_PRICES = {
@@ -1445,27 +1442,6 @@ def can_bypass_maintenance(user, user_id=None):
     if has_private_beta_access(resolved_user_id):
         return True
     metadata = user.get("user_metadata") or {}
-    access_code_hash = str(metadata.get("beta_access_code_hash") or "").strip().lower()
-    if (
-        re.fullmatch(r"[0-9a-f]{64}", PRIVATE_BETA_ACCESS_CODE_HASH)
-        and hmac.compare_digest(access_code_hash, PRIVATE_BETA_ACCESS_CODE_HASH)
-    ):
-        try:
-            supabase_request(
-                "PATCH",
-                "profiles",
-                params={"user_id": f"eq.{resolved_user_id}"},
-                body={
-                    "beta_access": True,
-                    "beta_invited_at": utc_now(),
-                    "updated_at": utc_now(),
-                },
-                prefer="return=minimal",
-            )
-            return True
-        except Exception:
-            app.logger.exception("Could not activate private beta access code")
-            return False
     token_hash = str(metadata.get("beta_invite_token_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", token_hash):
         return False
@@ -2063,14 +2039,18 @@ def private_beta_access_code_hash(value):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def private_beta_access_code_valid(value):
-    return bool(
-        re.fullmatch(r"[0-9a-f]{64}", PRIVATE_BETA_ACCESS_CODE_HASH)
-        and hmac.compare_digest(
-            private_beta_access_code_hash(value),
-            PRIVATE_BETA_ACCESS_CODE_HASH,
-        )
-    )
+def private_beta_access_code(value, *, include_redeemed=False):
+    code_hash = private_beta_access_code_hash(value)
+    params = {
+        "select": "id,label,email,created_at,use_count,max_uses,revoked_at",
+        "token_hash": f"eq.{code_hash}",
+        "revoked_at": "is.null",
+        "limit": "1",
+    }
+    if not include_redeemed:
+        params["use_count"] = "eq.0"
+    rows = supabase_request("GET", "private_beta_invites", params=params) or []
+    return rows[0] if rows else None
 
 
 def clean_spoken_text(value):
@@ -2701,17 +2681,48 @@ def validate_private_beta_access_code():
             "Too many code attempts. Wait ten minutes and try again.",
         )
     value = (request.get_json(silent=True) or {}).get("code")
-    if not private_beta_access_code_valid(value):
+    try:
+        code = private_beta_access_code(value)
+    except Exception:
+        app.logger.exception("Could not validate private beta code")
+        return api_error(503, "access_code_service_unavailable", "The access-code service is temporarily unavailable.")
+    if not code:
         return api_error(403, "invalid_access_code", "That private beta code is not valid.")
-    return jsonify({"valid": True})
+    return jsonify({"valid": True, "label": code.get("label") or "Private beta access"})
 
 
 @app.route("/v1/access-code/redeem", methods=["POST", "OPTIONS"])
 @auth_required
 def redeem_private_beta_access_code():
     value = (request.get_json(silent=True) or {}).get("code")
-    if not private_beta_access_code_valid(value):
-        return api_error(403, "invalid_access_code", "That private beta code is not valid.")
+    code_hash = private_beta_access_code_hash(value)
+    try:
+        result = supabase_request(
+            "POST",
+            "rpc/redeem_private_beta_invite",
+            body={
+                "p_token_hash": code_hash,
+                "p_user_id": g.user_id,
+                "p_user_email": user_email(g.user),
+            },
+        )
+        if isinstance(result, list):
+            result = result[0] if result else {}
+        result = result if isinstance(result, dict) else {}
+        if not result.get("ok"):
+            return api_error(403, "invalid_access_code", "That private beta code has already been used or is not valid.")
+        code_row = private_beta_access_code(value, include_redeemed=True)
+        if code_row:
+            supabase_request(
+                "PATCH",
+                "private_beta_invites",
+                params={"id": f"eq.{code_row['id']}"},
+                body={"email": user_email(g.user)},
+                prefer="return=minimal",
+            )
+    except Exception:
+        app.logger.exception("Could not redeem private beta code")
+        return api_error(503, "access_code_service_unavailable", "The access code could not be redeemed right now.")
     supabase_request(
         "PATCH",
         "profiles",
@@ -2723,7 +2734,7 @@ def redeem_private_beta_access_code():
         },
         prefer="return=minimal",
     )
-    return jsonify({"redeemed": True})
+    return jsonify({"redeemed": True, "label": result.get("label") or "Private beta access"})
 
 
 @app.route("/v1/invites/validate", methods=["POST", "OPTIONS"])
@@ -2801,42 +2812,63 @@ def admin_beta_invites():
             "GET",
             "private_beta_invites",
             params={
-                "select": "id,label,email,expires_at,max_uses,use_count,revoked_at,created_at",
+                "select": "id,label,email,created_at,use_count,revoked_at",
+                "expires_at": "gte.9999-01-01T00:00:00Z",
                 "order": "created_at.desc",
                 "limit": "100",
             },
         ) or []
-        return jsonify({"items": rows})
+        items = []
+        for row in rows:
+            redeemed_at = None
+            if int(row.get("use_count") or 0) > 0:
+                redemption = supabase_request(
+                    "GET",
+                    "private_beta_redemptions",
+                    params={
+                        "select": "redeemed_at",
+                        "invite_id": f"eq.{row['id']}",
+                        "limit": "1",
+                    },
+                ) or []
+                redeemed_at = redemption[0].get("redeemed_at") if redemption else row.get("created_at")
+            items.append({
+                "id": row.get("id"),
+                "label": row.get("label") or "Private beta guest",
+                "code_prefix": "VUR-",
+                "created_at": row.get("created_at"),
+                "redeemed_email": row.get("email") if redeemed_at else None,
+                "redeemed_at": redeemed_at,
+                "revoked_at": row.get("revoked_at"),
+            })
+        return jsonify({"items": items})
 
     payload = request.get_json(silent=True) or {}
     label = str(payload.get("label") or "Private beta guest").strip()[:80]
-    email = str(payload.get("email") or "").strip().lower()[:320] or None
-    if email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-        return api_error(400, "invalid_email", "Enter a valid email address or leave it blank.")
-    try:
-        days = max(1, min(30, int(payload.get("expires_in_days") or 7)))
-        max_uses = max(1, min(25, int(payload.get("max_uses") or 1)))
-    except (TypeError, ValueError):
-        return api_error(400, "invalid_invite_limits", "Invitation limits are invalid.")
-    token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    code = "VUR-" + "-".join(
+        "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+        for _ in range(3)
+    )
+    code_hash = private_beta_access_code_hash(code)
     created = supabase_request(
         "POST",
         "private_beta_invites",
         body={
-            "token_hash": token_hash,
+            "token_hash": code_hash,
             "label": label,
-            "email": email,
-            "expires_at": expires_at,
-            "max_uses": max_uses,
+            "email": None,
+            "expires_at": "9999-12-31T23:59:59+00:00",
+            "max_uses": 1,
             "created_by": g.user_id,
         },
         prefer="return=representation",
     )
     item = created[0]
     item.pop("token_hash", None)
-    item["invite_url"] = f"{FRONTEND_URL}/invite/{token}"
+    item["code_prefix"] = code[:8]
+    item["redeemed_email"] = None
+    item["redeemed_at"] = None
+    item["code"] = code
     return jsonify(item), 201
 
 
