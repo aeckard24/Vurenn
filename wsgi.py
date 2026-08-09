@@ -264,6 +264,7 @@ PLAN_RANK = {"free": 0, "pro": 1, "premier": 2}
 _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
 _tts_requests = defaultdict(deque)
+_invite_signup_requests = defaultdict(deque)
 _tts_engine = None
 _tts_ready = False
 _tts_engine_lock = threading.Lock()
@@ -2021,6 +2022,18 @@ def tts_rate_limited(user_id):
     return False
 
 
+def invite_signup_rate_limited(key):
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _invite_signup_requests[key]
+        while bucket and now - bucket[0] >= 600:
+            bucket.popleft()
+        if len(bucket) >= 8:
+            return True
+        bucket.append(now)
+    return False
+
+
 def clean_spoken_text(value):
     value = str(value or "")
     value = re.sub(
@@ -2635,6 +2648,80 @@ def beta_invite_state(invite):
     return "valid"
 
 
+def supabase_admin_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def existing_auth_user(email):
+    response = requests.get(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        params={"page": 1, "per_page": 1000},
+        headers=supabase_admin_headers(),
+        timeout=15,
+    )
+    if response.status_code >= 400:
+        return None
+    for item in response.json().get("users", []):
+        if str(item.get("email") or "").strip().lower() != email:
+            continue
+        return item
+    return None
+
+
+def create_confirmed_invite_user(email, password, metadata):
+    response = requests.post(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        headers=supabase_admin_headers(),
+        json={
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+            "user_metadata": metadata,
+        },
+        timeout=15,
+    )
+    if response.status_code in {200, 201}:
+        return response.json(), True
+    if response.status_code in {400, 409, 422}:
+        existing = existing_auth_user(email)
+        is_unconfirmed = bool(
+            existing
+            and existing.get("id")
+            and not existing.get("email_confirmed_at")
+            and not existing.get("confirmed_at")
+            and not existing.get("last_sign_in_at")
+        )
+        if is_unconfirmed:
+            update = requests.put(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{existing['id']}",
+                headers=supabase_admin_headers(),
+                json={
+                    "password": password,
+                    "email_confirm": True,
+                    "user_metadata": metadata,
+                },
+                timeout=15,
+            )
+            if update.status_code in {200, 201}:
+                return update.json(), False
+        if existing:
+            raise RuntimeError("INVITE_ACCOUNT_EXISTS")
+        raise RuntimeError("INVITE_ACCOUNT_CREATE_FAILED")
+    raise RuntimeError("INVITE_ACCOUNT_CREATE_FAILED")
+
+
+def delete_auth_user(user_id):
+    requests.delete(
+        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+        headers=supabase_admin_headers(),
+        timeout=15,
+    )
+
+
 @app.route("/v1/invites/validate", methods=["POST", "OPTIONS"])
 def validate_beta_invite():
     if request.method == "OPTIONS":
@@ -2663,6 +2750,86 @@ def validate_beta_invite():
             "email_hint": email_hint,
         }
     )
+
+
+@app.route("/v1/invites/signup", methods=["POST", "OPTIONS"])
+def signup_with_beta_invite():
+    if request.method == "OPTIONS":
+        return "", 204
+    forwarded = str(request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    rate_key = forwarded or str(request.remote_addr or "unknown")
+    if invite_signup_rate_limited(rate_key):
+        return api_error(429, "invite_signup_rate_limited", "Too many signup attempts. Wait a few minutes and try again.")
+
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("token") or "").strip()
+    email = str(payload.get("email") or "").strip().lower()[:320]
+    password = str(payload.get("password") or "")
+    display_name = str(payload.get("display_name") or "").strip()[:80]
+    legal_version = str(payload.get("legal_version") or "").strip()[:40]
+    legal_accepted_at = str(payload.get("legal_accepted_at") or "").strip()[:50]
+    age_confirmed = payload.get("age_confirmed") is True
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        return api_error(400, "invalid_email", "Enter a complete email address.")
+    if len(password) < 8 or len(password) > 128:
+        return api_error(400, "invalid_password", "Use a password between 8 and 128 characters.")
+    if not display_name:
+        return api_error(400, "display_name_required", "Enter your name.")
+    if not (legal_version and legal_accepted_at and age_confirmed):
+        return api_error(400, "legal_consent_required", "Accept the policies and confirm age eligibility to continue.")
+
+    try:
+        invite = private_beta_invite(token)
+    except Exception:
+        app.logger.exception("Could not validate invite signup")
+        return api_error(503, "invite_service_unavailable", "The invitation service is temporarily unavailable.")
+    state = beta_invite_state(invite)
+    if state != "valid":
+        return api_error(410 if state != "invalid" else 404, f"invite_{state}", "This invitation is invalid, expired, revoked, or full.")
+    required_email = str(invite.get("email") or "").strip().lower()
+    if required_email and required_email != email:
+        return api_error(403, "email_mismatch", "Use the email address this invitation was sent to.")
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    metadata = {
+        "display_name": display_name,
+        "legal_version": legal_version,
+        "legal_accepted_at": legal_accepted_at,
+        "terms_accepted": True,
+        "privacy_accepted": True,
+        "acceptable_use_accepted": True,
+        "age_confirmed": True,
+        "beta_invite_token_hash": token_hash,
+    }
+    user = None
+    created_new = False
+    try:
+        user, created_new = create_confirmed_invite_user(email, password, metadata)
+        user_id = str(user.get("id") or "")
+        if not user_id:
+            raise RuntimeError("INVITE_ACCOUNT_CREATE_FAILED")
+        result = supabase_request(
+            "POST",
+            "rpc/redeem_private_beta_invite",
+            body={
+                "p_token_hash": token_hash,
+                "p_user_id": user_id,
+                "p_user_email": email,
+            },
+        )
+        if isinstance(result, list):
+            result = result[0] if result else {}
+        if not isinstance(result, dict) or not result.get("ok"):
+            if created_new:
+                delete_auth_user(user_id)
+            code = str((result or {}).get("code") or "invite_unavailable")
+            return api_error(409, code, "This invitation could not be redeemed. Refresh the link and try again.")
+    except RuntimeError as error:
+        if str(error) == "INVITE_ACCOUNT_EXISTS":
+            return api_error(409, "account_exists", "An account with this email already exists. Choose Sign in instead.")
+        app.logger.exception("Could not create invite account")
+        return api_error(503, "invite_signup_failed", "Vurenn could not create the account right now. Please retry.", retryable=True)
+    return jsonify({"created": True, "email": email}), 201
 
 
 @app.route("/v1/invites/redeem", methods=["POST", "OPTIONS"])
@@ -2715,6 +2882,42 @@ def admin_beta_invites():
                 "limit": "100",
             },
         ) or []
+        redemptions = supabase_request(
+            "GET",
+            "private_beta_redemptions",
+            params={
+                "select": "invite_id,user_id,created_at",
+                "order": "created_at.desc",
+                "limit": "500",
+            },
+        ) or []
+        email_by_user = {}
+        try:
+            user_response = requests.get(
+                f"{SUPABASE_URL}/auth/v1/admin/users",
+                params={"page": 1, "per_page": 1000},
+                headers=supabase_admin_headers(),
+                timeout=15,
+            )
+            if user_response.status_code < 400:
+                email_by_user = {
+                    str(item.get("id")): str(item.get("email") or "")
+                    for item in user_response.json().get("users", [])
+                }
+        except Exception:
+            app.logger.exception("Could not attach emails to invite redemptions")
+        emails_by_invite = defaultdict(list)
+        for redemption in redemptions:
+            email = email_by_user.get(str(redemption.get("user_id")))
+            if email:
+                emails_by_invite[str(redemption.get("invite_id"))].append(
+                    {
+                        "email": email,
+                        "joined_at": redemption.get("created_at"),
+                    }
+                )
+        for item in rows:
+            item["redeemed_emails"] = emails_by_invite.get(str(item.get("id")), [])
         return jsonify({"items": rows})
 
     payload = request.get_json(silent=True) or {}
@@ -2745,6 +2948,7 @@ def admin_beta_invites():
     )
     item = created[0]
     item.pop("token_hash", None)
+    item["redeemed_emails"] = []
     item["invite_url"] = f"{FRONTEND_URL}/invite/{token}"
     return jsonify(item), 201
 
