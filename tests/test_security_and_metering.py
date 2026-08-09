@@ -36,6 +36,24 @@ class SecurityAndMeteringTests(unittest.TestCase):
         with patch.object(wsgi, "has_private_beta_access", return_value=True):
             self.assertTrue(wsgi.can_bypass_maintenance(user, user["id"]))
 
+    def test_signup_metadata_recovers_invite_after_email_confirmation(self):
+        user = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "guest@example.com",
+            "user_metadata": {"beta_invite_token_hash": "a" * 64},
+        }
+        with patch.object(
+            wsgi, "has_private_beta_access", return_value=False
+        ), patch.object(
+            wsgi,
+            "supabase_request",
+            return_value={"ok": True, "label": "Family & friends beta"},
+        ) as database:
+            self.assertTrue(wsgi.can_bypass_maintenance(user, user["id"]))
+        redemption = database.call_args
+        self.assertEqual(redemption.args[:2], ("POST", "rpc/redeem_private_beta_invite"))
+        self.assertEqual(redemption.kwargs["body"]["p_token_hash"], "a" * 64)
+
     def test_authenticated_user_without_invite_is_blocked_during_private_beta(self):
         user = {
             "id": "11111111-1111-1111-1111-111111111111",

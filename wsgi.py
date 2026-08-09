@@ -1394,7 +1394,29 @@ def has_private_beta_access(user_id):
 def can_bypass_maintenance(user, user_id=None):
     if user_email(user) in (ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS):
         return True
-    return has_private_beta_access(user_id or user.get("id"))
+    resolved_user_id = user_id or user.get("id")
+    if has_private_beta_access(resolved_user_id):
+        return True
+    metadata = user.get("user_metadata") or {}
+    token_hash = str(metadata.get("beta_invite_token_hash") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", token_hash):
+        return False
+    try:
+        result = supabase_request(
+            "POST",
+            "rpc/redeem_private_beta_invite",
+            body={
+                "p_token_hash": token_hash,
+                "p_user_id": resolved_user_id,
+                "p_user_email": user_email(user),
+            },
+        )
+        if isinstance(result, list):
+            result = result[0] if result else {}
+        return bool(isinstance(result, dict) and result.get("ok"))
+    except Exception:
+        app.logger.exception("Could not recover private beta access from signup")
+        return False
 
 
 def model_allowed(plan_id, model):
