@@ -127,6 +127,12 @@ PROJECT_LIMITS = {"free": 3, "pro": 50, "premier": None}
 CHAT_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("CHAT_RATE_LIMIT_PER_MINUTE", "20")
 )
+FREE_CHAT_MESSAGES_PER_WINDOW = int(
+    os.environ.get("FREE_CHAT_MESSAGES_PER_WINDOW", "20")
+)
+FREE_CHAT_WINDOW_HOURS = int(
+    os.environ.get("FREE_CHAT_WINDOW_HOURS", "5")
+)
 TTS_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("TTS_RATE_LIMIT_PER_MINUTE", "10")
 )
@@ -2229,6 +2235,45 @@ def get_credit_account(user_id):
     return created[0]
 
 
+def basic_chat_usage(user_id, *, now=None):
+    """Return the server-authoritative rolling Basic chat allowance."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FREE_CHAT_WINDOW_HOURS)
+    rows = supabase_request(
+        "GET",
+        "messages",
+        params={
+            "select": "created_at",
+            "user_id": f"eq.{user_id}",
+            "role": "eq.user",
+            "created_at": f"gte.{cutoff.isoformat()}",
+            "order": "created_at.asc",
+            "limit": str(FREE_CHAT_MESSAGES_PER_WINDOW),
+        },
+    ) or []
+    used = len(rows)
+    exhausted = used >= FREE_CHAT_MESSAGES_PER_WINDOW
+    reset_at = None
+    if exhausted and rows:
+        try:
+            oldest = datetime.fromisoformat(
+                str(rows[0].get("created_at") or "").replace("Z", "+00:00")
+            )
+            reset_at = (
+                oldest + timedelta(hours=FREE_CHAT_WINDOW_HOURS)
+            ).isoformat()
+        except ValueError:
+            reset_at = (now + timedelta(hours=FREE_CHAT_WINDOW_HOURS)).isoformat()
+    return {
+        "limit": FREE_CHAT_MESSAGES_PER_WINDOW,
+        "used": used,
+        "remaining": max(0, FREE_CHAT_MESSAGES_PER_WINDOW - used),
+        "window_hours": FREE_CHAT_WINDOW_HOURS,
+        "exhausted": exhausted,
+        "reset_at": reset_at,
+    }
+
+
 def spend_credits(user_id, amount, feature_id, idempotency_key, metadata=None):
     return supabase_request(
         "POST",
@@ -3256,12 +3301,14 @@ def update_construction_mode():
 def credits():
     account = get_credit_account(g.user_id)
     plan_id = user_plan(g.user, g.user_id)
+    basic_usage = basic_chat_usage(g.user_id) if plan_id == "free" else None
     return jsonify(
         {
             **account,
             "plan_id": plan_id,
             "metered": plan_id == "free",
             "unlimited": is_team(g.user) and plan_id == "premier",
+            "basic_usage": basic_usage,
         }
     )
 
@@ -4331,6 +4378,19 @@ def chat_stream():
             "plan_required",
             "Vurenn Max requires Premier access.",
         )
+    if effective_plan == "free":
+        basic_usage = basic_chat_usage(g.user_id)
+        if basic_usage["exhausted"]:
+            return api_error(
+                429,
+                "basic_usage_limit_reached",
+                "You've reached your Basic usage limit. Upgrade to continue.",
+                retryable=False,
+                details={
+                    **basic_usage,
+                    "upgrade_url": f"{FRONTEND_URL}/pricing",
+                },
+            )
     if chat_rate_limited(g.user_id):
         return api_error(
             429,

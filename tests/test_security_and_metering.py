@@ -9,6 +9,46 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_basic_usage_window_is_server_counted(self):
+        now = datetime(2026, 8, 9, 20, 0, tzinfo=timezone.utc)
+        rows = [
+            {"created_at": "2026-08-09T16:00:00+00:00"}
+            for _ in range(wsgi.FREE_CHAT_MESSAGES_PER_WINDOW)
+        ]
+        with patch.object(wsgi, "supabase_request", return_value=rows):
+            usage = wsgi.basic_chat_usage("11111111-1111-1111-1111-111111111111", now=now)
+        self.assertTrue(usage["exhausted"])
+        self.assertEqual(usage["remaining"], 0)
+        self.assertEqual(usage["reset_at"], "2026-08-09T21:00:00+00:00")
+
+    def test_basic_chat_limit_blocks_before_conversation_or_provider_work(self):
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": "guest@example.com"}
+        exhausted = {
+            "limit": 20,
+            "used": 20,
+            "remaining": 0,
+            "window_hours": 5,
+            "exhausted": True,
+            "reset_at": "2026-08-09T21:00:00+00:00",
+        }
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ), patch.object(wsgi, "user_plan", return_value="free"), patch.object(
+            wsgi, "basic_chat_usage", return_value=exhausted
+        ), patch.object(wsgi, "get_owned_conversation") as conversation_lookup:
+            response = wsgi.app.test_client().post(
+                "/v1/chat/stream",
+                json={
+                    "conversation_id": "conversation-1",
+                    "message": "Hello",
+                    "model": "vurenn-fast",
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.get_json()["code"], "basic_usage_limit_reached")
+        conversation_lookup.assert_not_called()
+
     def test_private_beta_access_code_is_server_validated(self):
         code = "VUR-ABCD-EFGH-JKLM"
         configured_hash = wsgi.private_beta_access_code_hash(code)
