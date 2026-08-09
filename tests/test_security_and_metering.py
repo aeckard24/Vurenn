@@ -9,6 +9,40 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_private_beta_access_code_is_server_validated(self):
+        code = "VURENN-BETA-8264"
+        configured_hash = wsgi.private_beta_access_code_hash(code)
+        with patch.object(wsgi, "PRIVATE_BETA_ACCESS_CODE_HASH", configured_hash), patch.object(
+            wsgi, "access_code_rate_limited", return_value=False
+        ):
+            accepted = wsgi.app.test_client().post(
+                "/v1/access-code/validate", json={"code": code.lower()}
+            )
+            rejected = wsgi.app.test_client().post(
+                "/v1/access-code/validate", json={"code": "wrong-code"}
+            )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(rejected.status_code, 403)
+
+    def test_private_beta_access_code_redeems_once_per_profile_without_global_limit(self):
+        code = "VURENN-BETA-8264"
+        configured_hash = wsgi.private_beta_access_code_hash(code)
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": "guest@example.com"}
+        with patch.object(wsgi, "PRIVATE_BETA_ACCESS_CODE_HASH", configured_hash), patch.object(
+            wsgi, "authenticate", return_value=user
+        ), patch.object(wsgi, "construction_mode_enabled", return_value=True), patch.object(
+            wsgi, "supabase_request", return_value=[]
+        ) as database:
+            response = wsgi.app.test_client().post(
+                "/v1/access-code/redeem", json={"code": code}
+            )
+        self.assertEqual(response.status_code, 200)
+        profile_update = next(
+            call for call in database.call_args_list
+            if call.args[:2] == ("PATCH", "profiles")
+        )
+        self.assertTrue(profile_update.kwargs["body"]["beta_access"])
+
     def test_private_beta_invitation_is_redeemed_without_exposing_raw_token(self):
         user_id = "11111111-1111-1111-1111-111111111111"
         raw_token = "private-beta-token-" + "x" * 32

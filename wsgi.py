@@ -69,6 +69,9 @@ GENERATED_IMAGE_SIGNING_SECRET = os.environ.get(
     "GENERATED_IMAGE_SIGNING_SECRET", ""
 )
 PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "").rstrip("/")
+PRIVATE_BETA_ACCESS_CODE_HASH = os.environ.get(
+    "PRIVATE_BETA_ACCESS_CODE_HASH", ""
+).strip().lower()
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 STRIPE_PRICES = {
@@ -264,6 +267,7 @@ PLAN_RANK = {"free": 0, "pro": 1, "premier": 2}
 _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
 _tts_requests = defaultdict(deque)
+_access_code_requests = defaultdict(deque)
 _tts_engine = None
 _tts_ready = False
 _tts_engine_lock = threading.Lock()
@@ -1441,6 +1445,27 @@ def can_bypass_maintenance(user, user_id=None):
     if has_private_beta_access(resolved_user_id):
         return True
     metadata = user.get("user_metadata") or {}
+    access_code_hash = str(metadata.get("beta_access_code_hash") or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", PRIVATE_BETA_ACCESS_CODE_HASH)
+        and hmac.compare_digest(access_code_hash, PRIVATE_BETA_ACCESS_CODE_HASH)
+    ):
+        try:
+            supabase_request(
+                "PATCH",
+                "profiles",
+                params={"user_id": f"eq.{resolved_user_id}"},
+                body={
+                    "beta_access": True,
+                    "beta_invited_at": utc_now(),
+                    "updated_at": utc_now(),
+                },
+                prefer="return=minimal",
+            )
+            return True
+        except Exception:
+            app.logger.exception("Could not activate private beta access code")
+            return False
     token_hash = str(metadata.get("beta_invite_token_hash") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", token_hash):
         return False
@@ -2021,6 +2046,33 @@ def tts_rate_limited(user_id):
     return False
 
 
+def access_code_rate_limited(key):
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _access_code_requests[key]
+        while bucket and now - bucket[0] >= 600:
+            bucket.popleft()
+        if len(bucket) >= 12:
+            return True
+        bucket.append(now)
+    return False
+
+
+def private_beta_access_code_hash(value):
+    normalized = str(value or "").strip().upper()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def private_beta_access_code_valid(value):
+    return bool(
+        re.fullmatch(r"[0-9a-f]{64}", PRIVATE_BETA_ACCESS_CODE_HASH)
+        and hmac.compare_digest(
+            private_beta_access_code_hash(value),
+            PRIVATE_BETA_ACCESS_CODE_HASH,
+        )
+    )
+
+
 def clean_spoken_text(value):
     value = str(value or "")
     value = re.sub(
@@ -2291,6 +2343,7 @@ def auth_required(handler):
         g.user_id = user["id"]
         invite_gate_routes = {
             "/v1/invites/redeem",
+            "/v1/access-code/redeem",
             "/v1/maintenance/access",
             "/v1/legal/consent",
             "/v1/profile",
@@ -2633,6 +2686,44 @@ def beta_invite_state(invite):
     if int(invite.get("use_count") or 0) >= int(invite.get("max_uses") or 1):
         return "full"
     return "valid"
+
+
+@app.route("/v1/access-code/validate", methods=["POST", "OPTIONS"])
+def validate_private_beta_access_code():
+    if request.method == "OPTIONS":
+        return "", 204
+    forwarded = str(request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    rate_key = forwarded or str(request.remote_addr or "unknown")
+    if access_code_rate_limited(rate_key):
+        return api_error(
+            429,
+            "access_code_rate_limited",
+            "Too many code attempts. Wait ten minutes and try again.",
+        )
+    value = (request.get_json(silent=True) or {}).get("code")
+    if not private_beta_access_code_valid(value):
+        return api_error(403, "invalid_access_code", "That private beta code is not valid.")
+    return jsonify({"valid": True})
+
+
+@app.route("/v1/access-code/redeem", methods=["POST", "OPTIONS"])
+@auth_required
+def redeem_private_beta_access_code():
+    value = (request.get_json(silent=True) or {}).get("code")
+    if not private_beta_access_code_valid(value):
+        return api_error(403, "invalid_access_code", "That private beta code is not valid.")
+    supabase_request(
+        "PATCH",
+        "profiles",
+        params={"user_id": f"eq.{g.user_id}"},
+        body={
+            "beta_access": True,
+            "beta_invited_at": utc_now(),
+            "updated_at": utc_now(),
+        },
+        prefer="return=minimal",
+    )
+    return jsonify({"redeemed": True})
 
 
 @app.route("/v1/invites/validate", methods=["POST", "OPTIONS"])
