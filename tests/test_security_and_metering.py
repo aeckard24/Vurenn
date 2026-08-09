@@ -211,6 +211,46 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertNotIn("server-image-key", str(post.call_args.kwargs["json"]))
         store.assert_called_once_with("user-1", b"webp-bytes")
 
+    def test_image_generation_classifies_provider_safety_block(self):
+        provider_response = Mock(
+            status_code=400,
+            text='{"error":{"code":"moderation_block"}}',
+            json=lambda: {
+                "error": {
+                    "code": "moderation_block",
+                    "type": "image_generation_user_error",
+                }
+            },
+        )
+        with patch.object(wsgi, "OPENAI_IMAGE_API_KEY", "server-image-key"), patch.object(
+            wsgi.requests, "post", return_value=provider_response
+        ):
+            with self.assertRaises(wsgi.ImageProviderError) as raised:
+                wsgi.generate_image_bytes("A benign product photo")
+        self.assertEqual(raised.exception.code, "IMAGE_PROVIDER_SAFETY_BLOCK")
+
+    def test_image_generation_retries_temporary_provider_failure(self):
+        busy = Mock(
+            status_code=503,
+            text='{"error":{"message":"busy"}}',
+            json=lambda: {"error": {"message": "busy"}},
+        )
+        success = Mock(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "data": [
+                    {"b64_json": base64.b64encode(b"webp-bytes").decode("ascii")}
+                ]
+            },
+        )
+        with patch.object(wsgi, "OPENAI_IMAGE_API_KEY", "server-image-key"), patch.object(
+            wsgi.requests, "post", side_effect=[busy, success]
+        ) as post, patch.object(wsgi.time, "sleep"):
+            result = wsgi.generate_image_bytes("A blue mug")
+        self.assertEqual(result, b"webp-bytes")
+        self.assertEqual(post.call_count, 2)
+
     def test_cloud_voice_uses_only_the_server_voice_key(self):
         provider_response = Mock(status_code=200, content=b"mp3-audio", text="")
         with patch.object(wsgi, "OPENAI_VOICE_API_KEY", "server-voice-key"), patch.object(
@@ -251,9 +291,15 @@ class SecurityAndMeteringTests(unittest.TestCase):
             "I am Claude from Anthropic. sk_test_abcdefghijklmnop"
         )
         self.assertNotIn("Claude", value)
-        self.assertNotIn("Anthropic", value)
         self.assertIn("Vurenn", value)
         self.assertIn("[private credential]", value)
+
+    def test_provider_disclosure_is_not_hidden(self):
+        value = wsgi.sanitize_assistant_text(
+            "Vurenn uses Anthropic APIs for some language capabilities and OpenAI APIs for images."
+        )
+        self.assertIn("Anthropic APIs", value)
+        self.assertIn("OpenAI APIs", value)
 
     def test_credit_cost_increases_with_usage(self):
         model = wsgi.MODEL_CATALOG["vurenn-max"]
