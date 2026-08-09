@@ -128,7 +128,7 @@ CHAT_RATE_LIMIT_PER_MINUTE = int(
     os.environ.get("CHAT_RATE_LIMIT_PER_MINUTE", "20")
 )
 FREE_CHAT_MESSAGES_PER_WINDOW = int(
-    os.environ.get("FREE_CHAT_MESSAGES_PER_WINDOW", "20")
+    os.environ.get("FREE_CHAT_MESSAGES_PER_WINDOW", "21")
 )
 FREE_CHAT_WINDOW_HOURS = int(
     os.environ.get("FREE_CHAT_WINDOW_HOURS", "5")
