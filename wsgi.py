@@ -2274,6 +2274,19 @@ def basic_chat_usage(user_id, *, now=None):
     }
 
 
+def basic_chat_requires_credits(
+    *, image_request=False, voice_mode=False, tool_feature_ids=None,
+    owned_attachments=None
+):
+    """Keep ordinary Basic chat inside its message allowance, not two quotas."""
+    return bool(
+        image_request
+        or voice_mode
+        or tool_feature_ids
+        or owned_attachments
+    )
+
+
 def spend_credits(user_id, amount, feature_id, idempotency_key, metadata=None):
     return supabase_request(
         "POST",
@@ -4401,7 +4414,6 @@ def chat_stream():
     conversation = get_owned_conversation(conversation_id, g.user_id)
     if not conversation:
         return api_error(404, "conversation_not_found", "Conversation not found.")
-    metered = effective_plan == "free"
     starting_balance = None
 
     previous = supabase_request(
@@ -4464,6 +4476,15 @@ def chat_stream():
         )
     if owned_attachments and "file_analysis" not in tool_feature_ids:
         tool_feature_ids.append("file_analysis")
+    # Basic text chat is governed by the rolling message allowance above. Do
+    # not also drain the user's top-off wallet for an ordinary conversation;
+    # credits remain reserved for provider-costly optional capabilities.
+    metered = effective_plan == "free" and basic_chat_requires_credits(
+        image_request=image_request,
+        voice_mode=voice_mode,
+        tool_feature_ids=tool_feature_ids,
+        owned_attachments=owned_attachments,
+    )
     local_answer = (
         local_utility_response(user_text)
         if not requested_tools and not owned_attachments

@@ -9,6 +9,13 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_basic_text_chat_is_not_double_charged_from_credit_wallet(self):
+        self.assertFalse(wsgi.basic_chat_requires_credits())
+        self.assertTrue(wsgi.basic_chat_requires_credits(image_request=True))
+        self.assertTrue(
+            wsgi.basic_chat_requires_credits(tool_feature_ids=["web_search"])
+        )
+
     def test_basic_usage_window_is_server_counted(self):
         now = datetime(2026, 8, 9, 20, 0, tzinfo=timezone.utc)
         rows = [
