@@ -3631,7 +3631,9 @@ def voice_config():
             "available": VOICE_ENABLED,
             "status": "available" if VOICE_ENABLED else "coming_soon",
             "transport": "server-neural",
-            "speech_recognition": "web-speech-api",
+            "speech_recognition": (
+                "openai-transcription" if OPENAI_VOICE_API_KEY else "web-speech-api"
+            ),
             "speech_synthesis": (
                 "openai-neural" if OPENAI_VOICE_API_KEY else "vurenn-neural"
             ),
@@ -3646,9 +3648,10 @@ def voice_config():
             ],
             "credit_cost": voice_credits_for_text("", bool(OPENAI_VOICE_API_KEY)),
             "privacy": (
-                "Speech input is transcribed by the browser. Completed replies "
-                "may be sent to Vurenn's configured speech provider to create "
-                "audio. Vurenn does not retain generated voice recordings."
+                "Voice recordings are sent securely to Vurenn's configured "
+                "speech provider for transcription. Completed replies may be "
+                "sent to the same provider to create audio. Vurenn does not "
+                "retain generated voice recordings."
             ),
         }
     )
