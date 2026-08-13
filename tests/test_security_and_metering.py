@@ -9,6 +9,21 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_mobile_audio_metadata_matches_the_recorded_container(self):
+        mobile_audio = b"\x00\x00\x00\x18ftypM4A " + b"audio"
+        upload = Mock(mimetype="audio/mp4;codecs=mp4a.40.2")
+        self.assertEqual(
+            wsgi.openai_audio_upload_metadata(upload, mobile_audio),
+            ("voice.m4a", "audio/mp4"),
+        )
+
+        webm_audio = b"\x1a\x45\xdf\xa3" + b"audio"
+        upload = Mock(mimetype="application/octet-stream")
+        self.assertEqual(
+            wsgi.openai_audio_upload_metadata(upload, webm_audio),
+            ("voice.webm", "audio/webm"),
+        )
+
     def test_basic_text_chat_is_not_double_charged_from_credit_wallet(self):
         self.assertFalse(wsgi.basic_chat_requires_credits())
         self.assertTrue(wsgi.basic_chat_requires_credits(image_request=True))

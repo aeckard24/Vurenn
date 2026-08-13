@@ -2302,25 +2302,55 @@ def synthesize_openai_speech(text, voice_id):
     return response.content
 
 
+def openai_audio_upload_metadata(file_storage, audio):
+    """Return trusted, matching filename/content-type metadata for OpenAI."""
+    raw_mime = str(file_storage.mimetype or "").split(";", 1)[0].lower()
+    if raw_mime == "video/mp4":
+        raw_mime = "audio/mp4"
+
+    detected = None
+    if audio.startswith(b"\x1a\x45\xdf\xa3"):
+        detected = ("voice.webm", "audio/webm")
+    elif len(audio) >= 12 and audio[4:8] == b"ftyp":
+        detected = ("voice.m4a", "audio/mp4")
+    elif audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+        detected = ("voice.wav", "audio/wav")
+    elif audio.startswith(b"OggS"):
+        detected = ("voice.ogg", "audio/ogg")
+    elif audio.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+        detected = ("voice.mp3", "audio/mpeg")
+
+    by_mime = {
+        "audio/webm": ("voice.webm", "audio/webm"),
+        "audio/mp4": ("voice.m4a", "audio/mp4"),
+        "audio/x-m4a": ("voice.m4a", "audio/mp4"),
+        "audio/ogg": ("voice.ogg", "audio/ogg"),
+        "audio/wav": ("voice.wav", "audio/wav"),
+        "audio/x-wav": ("voice.wav", "audio/wav"),
+        "audio/mpeg": ("voice.mp3", "audio/mpeg"),
+        "audio/mp3": ("voice.mp3", "audio/mpeg"),
+        "audio/flac": ("voice.flac", "audio/flac"),
+    }
+    return detected or by_mime.get(raw_mime) or ("voice.webm", "audio/webm")
+
+
 def transcribe_openai_audio(file_storage):
     audio = file_storage.read(12_000_001)
     if not audio:
         raise ValueError("EMPTY_AUDIO")
     if len(audio) > 12_000_000:
         raise ValueError("AUDIO_TOO_LARGE")
+    filename, content_type = openai_audio_upload_metadata(file_storage, audio)
     response = requests.post(
         "https://api.openai.com/v1/audio/transcriptions",
         headers={"Authorization": f"Bearer {OPENAI_VOICE_API_KEY}"},
         files={
-            "file": (
-                (file_storage.filename or "voice.webm")[:120],
-                audio,
-                file_storage.mimetype or "audio/webm",
-            )
+            "file": (filename, audio, content_type)
         },
         data={
             "model": OPENAI_TRANSCRIBE_MODEL,
             "response_format": "json",
+            "language": "en",
             "prompt": "A natural conversation with Vurenn. Preserve names and punctuation.",
         },
         timeout=(10, 90),
