@@ -450,6 +450,10 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertIn("deep_research", feature_ids)
         web_tool = next(tool for tool in provider_tools if tool["type"] == "web_search_20260318")
         self.assertEqual(web_tool["max_uses"], 20)
+        self.assertEqual(web_tool["allowed_callers"], ["direct"])
+        self.assertTrue(
+            all(tool.get("allowed_callers") == ["direct"] for tool in provider_tools)
+        )
 
     def test_excel_workbooks_are_routed_to_sandboxed_analysis(self):
         excel_type = (

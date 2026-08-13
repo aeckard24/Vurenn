@@ -59,8 +59,11 @@ OPENAI_IMAGE_SIZE = os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_TIMEOUT_SECONDS = int(
     os.environ.get("OPENAI_IMAGE_TIMEOUT_SECONDS", "180")
 )
-OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "")
-OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "tts-1-hd")
+OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "") or OPENAI_IMAGE_API_KEY
+OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-tts")
+OPENAI_TRANSCRIBE_MODEL = os.environ.get(
+    "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"
+)
 LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-08")
 GENERATED_IMAGE_BUCKET = os.environ.get(
     "GENERATED_IMAGE_BUCKET", "vurenn-generated-images"
@@ -378,7 +381,12 @@ TOOL_CATALOG = {
     "web_search": {
         "feature_id": "web_search",
         "provider_tools": [
-            {"type": "web_search_20260318", "name": "web_search", "max_uses": 3}
+            {
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "max_uses": 3,
+                "allowed_callers": ["direct"],
+            }
         ],
         "system": (
             "This request needs freshly verified information. You must use "
@@ -390,8 +398,17 @@ TOOL_CATALOG = {
     "deep_research": {
         "feature_id": "deep_research",
         "provider_tools": [
-            {"type": "web_search_20260318", "name": "web_search", "max_uses": 20},
-            {"type": "code_execution_20260521", "name": "code_execution"},
+            {
+                "type": "web_search_20260318",
+                "name": "web_search",
+                "max_uses": 20,
+                "allowed_callers": ["direct"],
+            },
+            {
+                "type": "code_execution_20260521",
+                "name": "code_execution",
+                "allowed_callers": ["direct"],
+            },
         ],
         "system": (
             "Perform genuine multi-step research with the available search budget. "
@@ -403,7 +420,11 @@ TOOL_CATALOG = {
     "data_analysis": {
         "feature_id": "data_analysis",
         "provider_tools": [
-            {"type": "code_execution_20260521", "name": "code_execution"}
+            {
+                "type": "code_execution_20260521",
+                "name": "code_execution",
+                "allowed_callers": ["direct"],
+            }
         ],
         "system": (
             "Use sandboxed code when useful for calculations or data analysis. "
@@ -471,6 +492,19 @@ DEFAULT_JOURNAL_CONTENT = {
         "decisions, lessons, and introductions to the people doing the work."
     ),
     "updates": [
+        {
+            "date": "August 12, 2026",
+            "category": "Product",
+            "title": "A faster, friendlier Vurenn across every screen",
+            "summary": (
+                "This release rebuilds the mobile chat and CEO admin experience, "
+                "fixes automatic live web search, prevents repeated streamed text, "
+                "makes ordinary replies feel lighter and more playful, upgrades "
+                "voice input and output through OpenAI audio services, simplifies "
+                "response activity, and introduces a sandboxed Developer Workspace "
+                "for building, editing, previewing, and exporting code."
+            ),
+        },
         {
             "date": "August 9, 2026",
             "category": "Founders",
@@ -621,6 +655,10 @@ RESPONSE_CRAFT_PROMPT = (
     "Write with clean punctuation, complete sentences, and natural transitions. "
     "Lead with the useful conclusion. Use short paragraphs and descriptive headings "
     "only when they improve scanning; do not turn every thought into a bold bullet. "
+    "Sound like a warm, quick-witted teammate: relaxed, curious, and lightly playful "
+    "when the subject allows it. Never scold, lecture, act defensive, or make the user "
+    "fight the interface. Correct mistakes kindly and move straight to the fix. "
+    "Do not repeat the same sentence, advice, disclaimer, or conclusion within one answer. "
     "For product or business ideas, pressure-test the problem, evidence, competitors, "
     "feasibility, regulation or intellectual property when relevant, economics, and the "
     "cheapest credible next experiment. Avoid canned praise, filler, and choppy fragments. "
@@ -1351,6 +1389,7 @@ def research_image_prompt(prompt):
                     "type": "web_search_20260318",
                     "name": "web_search",
                     "max_uses": 2,
+                    "allowed_callers": ["direct"],
                 }
             ],
         )
@@ -2156,19 +2195,26 @@ OPENAI_VOICE_MAP = {
 
 
 def synthesize_openai_speech(text, voice_id):
+    payload = {
+        "model": OPENAI_VOICE_MODEL,
+        "voice": OPENAI_VOICE_MAP.get(voice_id, "alloy"),
+        "input": text,
+        "response_format": "mp3",
+        "speed": max(0.8, min(1.2, TTS_SPEED)),
+    }
+    if OPENAI_VOICE_MODEL.startswith("gpt-4o"):
+        payload["instructions"] = (
+            "Speak as Vurenn: warm, playful, relaxed, and genuinely human. "
+            "Use natural pacing, subtle expression, and short conversational "
+            "phrasing. Never announce emoji or markdown."
+        )
     response = requests.post(
         "https://api.openai.com/v1/audio/speech",
         headers={
             "Authorization": f"Bearer {OPENAI_VOICE_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": OPENAI_VOICE_MODEL,
-            "voice": OPENAI_VOICE_MAP.get(voice_id, "alloy"),
-            "input": text,
-            "response_format": "mp3",
-            "speed": max(0.8, min(1.2, TTS_SPEED)),
-        },
+        json=payload,
         timeout=(10, 90),
     )
     if response.status_code >= 400 or not response.content:
@@ -2179,6 +2225,39 @@ def synthesize_openai_speech(text, voice_id):
         )
         raise RuntimeError("VOICE_PROVIDER_ERROR")
     return response.content
+
+
+def transcribe_openai_audio(file_storage):
+    audio = file_storage.read(12_000_001)
+    if not audio:
+        raise ValueError("EMPTY_AUDIO")
+    if len(audio) > 12_000_000:
+        raise ValueError("AUDIO_TOO_LARGE")
+    response = requests.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {OPENAI_VOICE_API_KEY}"},
+        files={
+            "file": (
+                (file_storage.filename or "voice.webm")[:120],
+                audio,
+                file_storage.mimetype or "audio/webm",
+            )
+        },
+        data={
+            "model": OPENAI_TRANSCRIBE_MODEL,
+            "response_format": "json",
+            "prompt": "A natural conversation with Vurenn. Preserve names and punctuation.",
+        },
+        timeout=(10, 90),
+    )
+    if response.status_code >= 400:
+        app.logger.error(
+            "OpenAI transcription failed (%s): %s",
+            response.status_code,
+            response.text[:300],
+        )
+        raise RuntimeError("TRANSCRIPTION_PROVIDER_ERROR")
+    return str((response.json() or {}).get("text") or "").strip()
 
 
 def warm_tts_engine():
@@ -3694,6 +3773,43 @@ def voice_synthesize():
             "X-Vurenn-Credits-Used": str(voice_cost if metered else 0),
         },
     )
+
+
+@app.route("/v1/voice/transcribe", methods=["POST", "OPTIONS"])
+@auth_required
+def voice_transcribe():
+    if not VOICE_ENABLED or not OPENAI_VOICE_API_KEY:
+        return api_error(
+            503,
+            "voice_transcription_unavailable",
+            "Natural voice input is temporarily unavailable.",
+            retryable=True,
+        )
+    if construction_mode_enabled() and not can_bypass_maintenance(g.user, g.user_id):
+        return api_error(503, "under_construction", "Vurenn is currently invite only.")
+    audio = request.files.get("audio")
+    if audio is None:
+        return api_error(422, "audio_required", "A voice recording is required.")
+    try:
+        transcript = transcribe_openai_audio(audio)
+    except ValueError as error:
+        code = str(error)
+        return api_error(
+            413 if code == "AUDIO_TOO_LARGE" else 422,
+            code.lower(),
+            "That recording is too large." if code == "AUDIO_TOO_LARGE" else "No speech was recorded.",
+        )
+    except Exception:
+        app.logger.exception("Voice transcription failed")
+        return api_error(
+            503,
+            "voice_transcription_failed",
+            "Vurenn could not hear that clearly. Please try again.",
+            retryable=True,
+        )
+    if not transcript:
+        return api_error(422, "empty_transcript", "Vurenn did not hear any speech.")
+    return jsonify({"text": transcript})
 
 
 @app.route("/v1/models", methods=["GET"])
