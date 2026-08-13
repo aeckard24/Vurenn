@@ -110,6 +110,13 @@ MAINTENANCE_BYPASS_EMAILS = {
     if value.strip()
 }
 TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS
+INVITE_MANAGER_EMAILS = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "INVITE_MANAGER_EMAILS", "aeckard41306@gmail.com"
+    ).split(",")
+    if value.strip()
+}
 
 # Credits are deliberately a small denomination. The two top-off packs sell at
 # roughly $0.0024-$0.0026 per credit, while metering budgets only $0.001 of
@@ -492,6 +499,21 @@ DEFAULT_JOURNAL_CONTENT = {
         "decisions, lessons, and introductions to the people doing the work."
     ),
     "updates": [
+        {
+            "date": "August 12, 2026",
+            "category": "Product",
+            "title": "Light mode, live follow-ups, and a real developer workspace",
+            "summary": (
+                "Every appearance preset now has a complete light palette. Live "
+                "search carries context across follow-up answers, web activity is "
+                "shown in a compact status line, and explicit requests for silence "
+                "are honored. Developer Workspace now combines persistent Vurenn "
+                "chat with a multi-file editor, isolated preview, browser console, "
+                "revision history, local autosave, and export. Andrew Eckard also "
+                "has a narrowly scoped access-code workspace; CEO-only controls and "
+                "reporting remain restricted."
+            ),
+        },
         {
             "date": "August 12, 2026",
             "category": "Product",
@@ -1461,6 +1483,10 @@ def is_admin(user):
     return user_email(user) in ADMIN_EMAILS
 
 
+def can_manage_invites(user):
+    return is_admin(user) or user_email(user) in INVITE_MANAGER_EMAILS
+
+
 def has_private_beta_access(user_id):
     if not user_id:
         return False
@@ -1585,7 +1611,54 @@ def selected_tool_configuration(tool_ids):
     return provider_tools, system_parts, feature_ids
 
 
-def infer_requested_tools(user_text, has_attachments=False):
+def web_search_followup(user_text, conversation_context=None):
+    text = str(user_text or "").strip().lower()
+    if not text or len(text) > 240 or not conversation_context:
+        return False
+    recent = list(conversation_context)[-4:]
+    prior_user = " ".join(
+        str(item.get("content") or "").lower()
+        for item in recent
+        if item.get("role") == "user"
+    )
+    prior_assistant = " ".join(
+        str(item.get("content") or "").lower()
+        for item in recent
+        if item.get("role") == "assistant"
+    )
+    pending_live_request = current_information_requires_web(prior_user) or any(
+        marker in prior_user
+        for marker in (
+            "weather", "live search", "search the web", "current price",
+            "latest", "right now", "today",
+        )
+    )
+    assistant_requested_detail = any(
+        marker in prior_assistant
+        for marker in (
+            "your location", "which location", "what location", "which city",
+            "what city", "which state", "zip code", "where are you",
+            "tell me the location", "need your location",
+        )
+    )
+    acknowledgement_only = bool(re.fullmatch(
+        r"(?:ok(?:ay)?|thanks?|thank you|got it|cool|sounds good)[.! ]*", text
+    ))
+    return pending_live_request and assistant_requested_detail and not acknowledgement_only
+
+
+def explicit_silence_requested(user_text):
+    text = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+    return bool(
+        re.search(
+            r"\b(?:do not|don't|dont|no need to)\s+(?:reply|respond|answer|say anything)\b",
+            text,
+        )
+        or re.search(r"\b(?:send|return)\s+(?:a\s+)?blank\s+(?:reply|response)\b", text)
+    )
+
+
+def infer_requested_tools(user_text, has_attachments=False, conversation_context=None):
     text = str(user_text or "").lower()
     inferred = []
     contains_web_link = bool(re.search(r"https?://[^\s]+", text))
@@ -1610,7 +1683,9 @@ def infer_requested_tools(user_text, has_attachments=False):
         )
     ):
         inferred.append("deep_research")
-    elif contains_web_link or current_information_requires_web(text) or any(
+    elif contains_web_link or current_information_requires_web(text) or web_search_followup(
+        user_text, conversation_context
+    ) or any(
         phrase in text
         for phrase in (
             "search the web",
@@ -2502,6 +2577,17 @@ def team_required(handler):
     return wrapped
 
 
+def invite_manager_required(handler):
+    @wraps(handler)
+    @auth_required
+    def wrapped(*args, **kwargs):
+        if not can_manage_invites(g.user):
+            return api_error(403, "invite_manager_required", "Access-code manager permission required.")
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
 def api_key_required(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
@@ -2941,47 +3027,68 @@ def redeem_beta_invite():
     return jsonify({"redeemed": True, "label": result.get("label") or "Private beta"})
 
 
-@app.route("/v1/admin/invites", methods=["GET", "POST", "OPTIONS"])
-@admin_required
-def admin_beta_invites():
-    if request.method == "GET":
-        rows = supabase_request(
-            "GET",
-            "private_beta_invites",
-            params={
-                "select": "id,label,email,created_at,use_count,revoked_at",
-                "expires_at": "gte.9999-01-01T00:00:00Z",
-                "order": "created_at.desc",
-                "limit": "100",
-            },
-        ) or []
-        items = []
-        for row in rows:
-            redeemed_at = None
-            if int(row.get("use_count") or 0) > 0:
-                redemption = supabase_request(
-                    "GET",
-                    "private_beta_redemptions",
-                    params={
-                        "select": "redeemed_at",
-                        "invite_id": f"eq.{row['id']}",
-                        "limit": "1",
-                    },
-                ) or []
-                redeemed_at = redemption[0].get("redeemed_at") if redemption else row.get("created_at")
-            items.append({
-                "id": row.get("id"),
-                "label": row.get("label") or "Private beta guest",
-                "code_prefix": "VUR-",
-                "created_at": row.get("created_at"),
-                "redeemed_email": row.get("email") if redeemed_at else None,
-                "redeemed_at": redeemed_at,
-                "revoked_at": row.get("revoked_at"),
-            })
-        return jsonify({"items": items})
+def beta_code_items(created_by=None):
+    params = {
+        "select": "id,label,email,created_by,created_at,use_count,revoked_at",
+        "expires_at": "gte.9999-01-01T00:00:00Z",
+        "order": "created_at.desc",
+        "limit": "100",
+    }
+    if created_by:
+        params["created_by"] = f"eq.{created_by}"
+    rows = supabase_request("GET", "private_beta_invites", params=params) or []
+    user_response = requests.get(
+        f"{SUPABASE_URL}/auth/v1/admin/users",
+        params={"page": 1, "per_page": 1000},
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        },
+        timeout=15,
+    )
+    auth_users = user_response.json().get("users", []) if user_response.status_code == 200 else []
+    email_by_id = {
+        str(item.get("id")): user_email(item) or None for item in auth_users
+    }
 
+    def email_for(user_id):
+        return email_by_id.get(str(user_id)) if user_id else None
+
+    items = []
+    for row in rows:
+        redeemed_at = None
+        redeemed_email = None
+        if int(row.get("use_count") or 0) > 0:
+            redemption = supabase_request(
+                "GET",
+                "private_beta_redemptions",
+                params={
+                    "select": "user_id,redeemed_at",
+                    "invite_id": f"eq.{row['id']}",
+                    "limit": "1",
+                },
+            ) or []
+            if redemption:
+                redeemed_at = redemption[0].get("redeemed_at")
+                redeemed_email = email_for(redemption[0].get("user_id"))
+            else:
+                redeemed_at = row.get("created_at")
+        items.append({
+            "id": row.get("id"),
+            "label": row.get("label") or "Private beta guest",
+            "code_prefix": "VUR-",
+            "created_at": row.get("created_at"),
+            "created_by_email": email_for(row.get("created_by")),
+            "redeemed_email": redeemed_email,
+            "redeemed_at": redeemed_at,
+            "revoked_at": row.get("revoked_at"),
+        })
+    return items
+
+
+def create_beta_code(label, creator_id):
     payload = request.get_json(silent=True) or {}
-    label = str(payload.get("label") or "Private beta guest").strip()[:80]
+    label = str(label or payload.get("label") or "Private beta guest").strip()[:80]
     code = "VUR-" + "-".join(
         "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
         for _ in range(3)
@@ -2996,7 +3103,7 @@ def admin_beta_invites():
             "email": None,
             "expires_at": "9999-12-31T23:59:59+00:00",
             "max_uses": 1,
-            "created_by": g.user_id,
+            "created_by": creator_id,
         },
         prefer="return=representation",
     )
@@ -3006,7 +3113,45 @@ def admin_beta_invites():
     item["redeemed_email"] = None
     item["redeemed_at"] = None
     item["code"] = code
-    return jsonify(item), 201
+    item["created_by_email"] = user_email(g.user)
+    return item
+
+
+@app.route("/v1/admin/invites", methods=["GET", "POST", "OPTIONS"])
+@admin_required
+def admin_beta_invites():
+    if request.method == "GET":
+        return jsonify({"items": beta_code_items()})
+    payload = request.get_json(silent=True) or {}
+    return jsonify(create_beta_code(payload.get("label"), g.user_id)), 201
+
+
+@app.route("/v1/team/invites", methods=["GET", "POST", "OPTIONS"])
+@invite_manager_required
+def managed_beta_invites():
+    if request.method == "GET":
+        return jsonify({"items": beta_code_items(g.user_id)})
+    payload = request.get_json(silent=True) or {}
+    return jsonify(create_beta_code(payload.get("label"), g.user_id)), 201
+
+
+@app.route("/v1/team/invites/<invite_id>", methods=["DELETE", "OPTIONS"])
+@invite_manager_required
+def revoke_managed_beta_invite(invite_id):
+    try:
+        uuid.UUID(invite_id)
+    except ValueError:
+        return api_error(400, "invalid_invite_id", "Invitation ID is invalid.")
+    rows = supabase_request(
+        "PATCH",
+        "private_beta_invites",
+        params={"id": f"eq.{invite_id}", "created_by": f"eq.{g.user_id}"},
+        body={"revoked_at": utc_now()},
+        prefer="return=representation",
+    ) or []
+    if not rows:
+        return api_error(404, "invite_not_found", "That access code was not found.")
+    return "", 204
 
 
 @app.route("/v1/admin/invites/<invite_id>", methods=["DELETE", "OPTIONS"])
@@ -3064,6 +3209,7 @@ def team_mode():
         {
             "eligible": eligible,
             "admin": is_admin(g.user),
+            "can_manage_invites": can_manage_invites(g.user),
             "limited_mode": limited,
             "unlimited": eligible and not limited,
             "effective_plan": user_plan(g.user, g.user_id),
@@ -4434,26 +4580,6 @@ def chat_stream():
     has_code_execution_attachment = any(
         is_code_execution_attachment(item) for item in attachment_metadata
     )
-    requested_tools = list(
-        dict.fromkeys(
-            [str(tool_id) for tool_id in requested_tools]
-            + infer_requested_tools(
-                user_text,
-                has_attachments=bool(attachment_metadata),
-            )
-            + (["data_analysis"] if has_code_execution_attachment else [])
-        )
-    )
-    # Deep research already includes live web search. Keeping both would charge
-    # twice and could accidentally retain the smaller ordinary-search budget.
-    if "deep_research" in requested_tools:
-        requested_tools = [
-            tool_id for tool_id in requested_tools if tool_id != "web_search"
-        ]
-    provider_tools, tool_system_parts, tool_feature_ids = (
-        selected_tool_configuration(requested_tools)
-    )
-    image_request = "image_generation" in requested_tools
     feature_id = (
         "voice_turn"
         if voice_mode
@@ -4551,6 +4677,27 @@ def chat_stream():
     # context; model messages still need chronological order.
     previous.reverse()
     previous = trim_conversation_history(previous, model_id)
+    requested_tools = list(
+        dict.fromkeys(
+            [str(tool_id) for tool_id in requested_tools]
+            + infer_requested_tools(
+                user_text,
+                has_attachments=bool(attachment_metadata),
+                conversation_context=previous,
+            )
+            + (["data_analysis"] if has_code_execution_attachment else [])
+        )
+    )
+    # Deep research already includes live web search. Keeping both would charge
+    # twice and could accidentally retain the smaller ordinary-search budget.
+    if "deep_research" in requested_tools:
+        requested_tools = [
+            tool_id for tool_id in requested_tools if tool_id != "web_search"
+        ]
+    provider_tools, tool_system_parts, tool_feature_ids = (
+        selected_tool_configuration(requested_tools)
+    )
+    image_request = "image_generation" in requested_tools
     user_message_id = str(uuid.uuid4())
     assistant_message_id = str(uuid.uuid4())
     now = utc_now()
@@ -4604,9 +4751,10 @@ def chat_stream():
         tool_feature_ids=tool_feature_ids,
         owned_attachments=owned_attachments,
     )
+    silent_response = explicit_silence_requested(user_text)
     local_answer = (
         local_utility_response(user_text)
-        if not requested_tools and not owned_attachments
+        if not silent_response and not requested_tools and not owned_attachments
         else None
     )
     if image_request and not image_service_configured():
@@ -4871,6 +5019,19 @@ def chat_stream():
         balance_after = starting_balance
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
+            if silent_response:
+                yield sse(
+                    "message_completed",
+                    {
+                        "message_id": assistant_message_id,
+                        "conversation_id": conversation_id,
+                        "usage": usage,
+                        "credit_charge": 0,
+                        "credits_remaining": balance_after,
+                        "silent": True,
+                    },
+                )
+                return
             if local_answer is not None:
                 safe_text = prepare_reply_text(local_answer)
                 full_text.append(safe_text)

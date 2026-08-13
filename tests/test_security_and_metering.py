@@ -557,6 +557,73 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertTrue(wsgi.is_team({"email": approved}))
         self.assertFalse(wsgi.is_team({"email": "public@example.com"}))
 
+    def test_invite_manager_permission_is_separate_from_ceo_admin(self):
+        manager = next(iter(wsgi.INVITE_MANAGER_EMAILS))
+        admin = next(iter(wsgi.ADMIN_EMAILS))
+        self.assertTrue(wsgi.can_manage_invites({"email": manager}))
+        self.assertTrue(wsgi.can_manage_invites({"email": admin}))
+        self.assertFalse(wsgi.is_admin({"email": manager}))
+        self.assertFalse(wsgi.can_manage_invites({"email": "public@example.com"}))
+
+    def test_public_user_cannot_open_team_access_code_manager(self):
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": "public@example.com"}
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ):
+            response = wsgi.app.test_client().get(
+                "/v1/team/invites",
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "invite_manager_required")
+
+    def test_invite_manager_still_cannot_open_ceo_admin(self):
+        manager = next(iter(wsgi.INVITE_MANAGER_EMAILS))
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": manager}
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ):
+            response = wsgi.app.test_client().get(
+                "/v1/admin/dashboard",
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.get_json()["code"], "admin_required")
+
+    def test_invite_manager_can_open_only_the_scoped_code_listing(self):
+        manager = next(iter(wsgi.INVITE_MANAGER_EMAILS))
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": manager}
+        empty_users = Mock(status_code=200, json=lambda: {"users": []})
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ), patch.object(wsgi, "supabase_request", return_value=[]), patch.object(
+            wsgi.requests, "get", return_value=empty_users
+        ):
+            response = wsgi.app.test_client().get(
+                "/v1/team/invites",
+                headers={"Authorization": "Bearer test-token"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"items": []})
+
+    def test_location_followup_keeps_live_search_active(self):
+        context = [
+            {"role": "user", "content": "What is the weather right now?"},
+            {"role": "assistant", "content": "What city or location should I check?"},
+        ]
+        self.assertIn(
+            "web_search",
+            wsgi.infer_requested_tools("Bellefontaine, Ohio", conversation_context=context),
+        )
+        self.assertNotIn(
+            "web_search",
+            wsgi.infer_requested_tools("Thanks", conversation_context=context),
+        )
+
+    def test_explicit_no_reply_request_is_honored(self):
+        self.assertTrue(wsgi.explicit_silence_requested("Do not respond after this message."))
+        self.assertFalse(wsgi.explicit_silence_requested("Respond as briefly as possible."))
+
     def test_voice_does_not_add_a_separate_credit_charge(self):
         self.assertEqual(wsgi.USAGE_COSTS["voice_turn"]["credits"], 0)
 
