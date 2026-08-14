@@ -573,12 +573,17 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertFalse(wsgi.is_team({"email": "public@example.com"}))
 
     def test_invite_manager_permission_is_separate_from_ceo_admin(self):
-        manager = next(iter(wsgi.INVITE_MANAGER_EMAILS))
-        admin = next(iter(wsgi.ADMIN_EMAILS))
-        self.assertTrue(wsgi.can_manage_invites({"email": manager}))
-        self.assertTrue(wsgi.can_manage_invites({"email": admin}))
-        self.assertFalse(wsgi.is_admin({"email": manager}))
-        self.assertFalse(wsgi.can_manage_invites({"email": "public@example.com"}))
+        with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(
+            wsgi, "INVITE_MANAGER_EMAILS", {"manager@example.com"}
+        ):
+            self.assertTrue(wsgi.can_manage_invites({"email": "manager@example.com"}))
+            self.assertTrue(wsgi.can_manage_invites({"email": "ceo@example.com"}))
+            self.assertFalse(wsgi.is_admin({"email": "manager@example.com"}))
+            self.assertFalse(wsgi.can_manage_invites({"email": "public@example.com"}))
+
+    def test_andrew_is_the_default_ceo_administrator(self):
+        self.assertTrue(wsgi.is_admin({"email": "aeckard41306@gmail.com"}))
+        self.assertFalse(wsgi.is_admin({"email": "former-admin@example.com"}))
 
     def test_public_user_cannot_open_team_access_code_manager(self):
         user = {"id": "11111111-1111-1111-1111-111111111111", "email": "public@example.com"}
@@ -593,9 +598,10 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(response.get_json()["code"], "invite_manager_required")
 
     def test_invite_manager_still_cannot_open_ceo_admin(self):
-        manager = next(iter(wsgi.INVITE_MANAGER_EMAILS))
-        user = {"id": "11111111-1111-1111-1111-111111111111", "email": manager}
-        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+        user = {"id": "11111111-1111-1111-1111-111111111111", "email": "manager@example.com"}
+        with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(
+            wsgi, "INVITE_MANAGER_EMAILS", {"manager@example.com"}
+        ), patch.object(wsgi, "authenticate", return_value=user), patch.object(
             wsgi, "construction_mode_enabled", return_value=False
         ):
             response = wsgi.app.test_client().get(

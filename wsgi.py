@@ -97,7 +97,7 @@ FRONTEND_ORIGINS = {
 ADMIN_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
-        "ADMIN_EMAILS", "noahssteiner@icloud.com"
+        "ADMIN_EMAILS", "aeckard41306@gmail.com"
     ).split(",")
     if value.strip()
 }
@@ -105,7 +105,7 @@ MAINTENANCE_BYPASS_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
         "MAINTENANCE_BYPASS_EMAILS",
-        os.environ.get("ADMIN_EMAILS", "noahssteiner@icloud.com"),
+        os.environ.get("ADMIN_EMAILS", "aeckard41306@gmail.com"),
     ).split(",")
     if value.strip()
 }
@@ -606,14 +606,9 @@ DEFAULT_JOURNAL_CONTENT = {
     ],
     "team": [
         {
-            "name": "Noah Steiner",
-            "role": "CEO · Frontend developer · Treasurer",
-            "note": "Product direction, company strategy, frontend development, and financial oversight.",
-        },
-        {
             "name": "Andrew Eckard",
-            "role": "Coder",
-            "note": "Backend engineering, infrastructure, and the systems that power Vurenn.",
+            "role": "CEO · Lead developer",
+            "note": "Company leadership, product direction, engineering, infrastructure, and operations.",
         },
         {
             "name": "Kendric",
