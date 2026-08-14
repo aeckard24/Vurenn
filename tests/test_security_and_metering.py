@@ -585,6 +585,20 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertTrue(wsgi.is_admin({"email": "aeckard41306@gmail.com"}))
         self.assertFalse(wsgi.is_admin({"email": "former-admin@example.com"}))
 
+    def test_saved_journal_cannot_restore_former_operator(self):
+        stored = {
+            "intro": "Updates",
+            "updates": [],
+            "team": [
+                {"name": "Noah Steiner", "role": "CEO", "note": "Former role"},
+                {"name": "Andrew", "role": "Coder", "note": "Old role"},
+            ],
+        }
+        with patch.object(wsgi, "supabase_request", return_value=[{"value": stored}]):
+            content = wsgi.journal_content()
+        self.assertEqual([person["name"] for person in content["team"]], ["Andrew Eckard"])
+        self.assertEqual(content["team"][0]["role"], "CEO · Lead developer")
+
     def test_public_user_cannot_open_team_access_code_manager(self):
         user = {"id": "11111111-1111-1111-1111-111111111111", "email": "public@example.com"}
         with patch.object(wsgi, "authenticate", return_value=user), patch.object(

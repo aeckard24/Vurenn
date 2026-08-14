@@ -802,9 +802,15 @@ def journal_content():
                 if item.get("title") not in existing_titles
             ]
             content["updates"] = [*missing_updates, *content["updates"]][:12]
+            content["team"] = [
+                person
+                for person in content["team"]
+                if person.get("name", "").strip().lower()
+                not in {"noah", "noah steiner"}
+            ]
             for person in content["team"]:
-                if person.get("name") == "Andrew":
-                    person["name"] = "Andrew Eckard"
+                if person.get("name") in {"Andrew", "Andrew Eckard"}:
+                    person.update(DEFAULT_JOURNAL_CONTENT["team"][0])
             return content
     except Exception:
         app.logger.exception("Could not read journal content")
