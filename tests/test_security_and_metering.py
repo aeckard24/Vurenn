@@ -10,6 +10,12 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def setUp(self):
+        with wsgi._request_cache_lock:
+            wsgi._auth_cache.clear()
+            wsgi._beta_access_cache.clear()
+            wsgi._construction_mode_cache.update(value=False, expires_at=0.0)
+
     def test_authentication_reuses_the_supabase_connection_pool(self):
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -25,9 +31,36 @@ class SecurityAndMeteringTests(unittest.TestCase):
             "wsgi.requests.get"
         ) as unpooled_get:
             user = wsgi.authenticate()
+            cached_user = wsgi.authenticate()
         self.assertEqual(user["email"], "guest@example.com")
+        self.assertEqual(cached_user["id"], user["id"])
         pooled_get.assert_called_once()
         unpooled_get.assert_not_called()
+
+    def test_construction_and_beta_access_checks_are_cached(self):
+        def database(method, path, **kwargs):
+            if path == "app_settings":
+                return [{"value": {"enabled": True}}]
+            if path == "profiles":
+                return [{"beta_access": True}]
+            return []
+
+        with patch.object(wsgi, "supabase_request", side_effect=database) as request_mock:
+            self.assertTrue(wsgi.construction_mode_enabled())
+            self.assertTrue(wsgi.construction_mode_enabled())
+            self.assertTrue(wsgi.has_private_beta_access("user-1"))
+            self.assertTrue(wsgi.has_private_beta_access("user-1"))
+
+        app_settings_calls = [
+            call for call in request_mock.call_args_list
+            if call.args[:2] == ("GET", "app_settings")
+        ]
+        profile_calls = [
+            call for call in request_mock.call_args_list
+            if call.args[:2] == ("GET", "profiles")
+        ]
+        self.assertEqual(len(app_settings_calls), 1)
+        self.assertEqual(len(profile_calls), 1)
 
     def test_fast_model_does_not_retry_the_same_overloaded_provider(self):
         fast_model = wsgi.MODEL_CATALOG["vurenn-fast"]["provider_model"]

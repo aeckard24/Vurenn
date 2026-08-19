@@ -283,6 +283,17 @@ _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
 _tts_requests = defaultdict(deque)
 _access_code_requests = defaultdict(deque)
+_request_cache_lock = threading.Lock()
+_auth_cache = {}
+_beta_access_cache = {}
+_construction_mode_cache = {"value": False, "expires_at": 0.0}
+AUTH_CACHE_TTL_SECONDS = float(os.environ.get("AUTH_CACHE_TTL_SECONDS", "30"))
+BETA_ACCESS_CACHE_TTL_SECONDS = float(
+    os.environ.get("BETA_ACCESS_CACHE_TTL_SECONDS", "300")
+)
+CONSTRUCTION_CACHE_TTL_SECONDS = float(
+    os.environ.get("CONSTRUCTION_CACHE_TTL_SECONDS", "10")
+)
 _tts_engine = None
 _tts_ready = False
 _tts_engine_lock = threading.Lock()
@@ -501,6 +512,18 @@ DEFAULT_JOURNAL_CONTENT = {
         "decisions, lessons, and introductions to the people doing the work."
     ),
     "updates": [
+        {
+            "date": "August 19, 2026",
+            "category": "Performance",
+            "title": "A faster path from send to first word",
+            "summary": (
+                "Vurenn now safely reuses recent sign-in and private-beta checks, "
+                "loads conversation context, history, and preferences in parallel, "
+                "and saves messages without delaying response generation. A new "
+                "once-per-release update window also makes meaningful changes easy "
+                "to find without interrupting every visit."
+            ),
+        },
         {
             "date": "August 12, 2026",
             "category": "Product",
@@ -1493,6 +1516,11 @@ def can_manage_invites(user):
 def has_private_beta_access(user_id):
     if not user_id:
         return False
+    now = time.monotonic()
+    with _request_cache_lock:
+        cached = _beta_access_cache.get(str(user_id))
+        if cached and cached[1] > now:
+            return cached[0]
     try:
         rows = supabase_request(
             "GET",
@@ -1503,7 +1531,13 @@ def has_private_beta_access(user_id):
                 "limit": "1",
             },
         ) or []
-        return bool(rows and rows[0].get("beta_access"))
+        allowed = bool(rows and rows[0].get("beta_access"))
+        ttl = BETA_ACCESS_CACHE_TTL_SECONDS if allowed else 5.0
+        with _request_cache_lock:
+            if len(_beta_access_cache) >= 4096 and str(user_id) not in _beta_access_cache:
+                _beta_access_cache.pop(next(iter(_beta_access_cache)))
+            _beta_access_cache[str(user_id)] = (allowed, now + ttl)
+        return allowed
     except Exception:
         app.logger.exception("Could not verify private beta access")
         return False
@@ -2385,6 +2419,10 @@ if TTS_WARM_ON_START:
 
 
 def construction_mode_enabled():
+    now = time.monotonic()
+    with _request_cache_lock:
+        if _construction_mode_cache["expires_at"] > now:
+            return _construction_mode_cache["value"]
     try:
         rows = supabase_request(
             "GET",
@@ -2395,7 +2433,13 @@ def construction_mode_enabled():
                 "limit": "1",
             },
         )
-        return bool(rows and (rows[0].get("value") or {}).get("enabled"))
+        enabled = bool(rows and (rows[0].get("value") or {}).get("enabled"))
+        with _request_cache_lock:
+            _construction_mode_cache.update(
+                value=enabled,
+                expires_at=now + CONSTRUCTION_CACHE_TTL_SECONDS,
+            )
+        return enabled
     except Exception:
         app.logger.exception("Could not read construction mode")
         return False
@@ -2535,6 +2579,12 @@ def authenticate():
     token = authorization.removeprefix("Bearer ").strip()
     if not token or not supabase_configured():
         return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    with _request_cache_lock:
+        cached = _auth_cache.get(token_hash)
+        if cached and cached[1] > now:
+            return dict(cached[0])
     # Reuse the same connection pool as PostgREST calls. Creating a fresh TLS
     # connection for every authenticated API request noticeably delays chat.
     response = SUPABASE_HTTP.get(
@@ -2548,7 +2598,13 @@ def authenticate():
     if response.status_code != 200:
         return None
     user = response.json()
-    return user if user.get("id") else None
+    if not user.get("id"):
+        return None
+    with _request_cache_lock:
+        if len(_auth_cache) >= 2048:
+            _auth_cache.pop(next(iter(_auth_cache)))
+        _auth_cache[token_hash] = (dict(user), now + AUTH_CACHE_TTL_SECONDS)
+    return user
 
 
 def auth_user_by_id(user_id):
@@ -2569,8 +2625,21 @@ def auth_user_by_id(user_id):
 def auth_required(handler):
     @wraps(handler)
     def wrapped(*args, **kwargs):
+        g.request_started_at = time.perf_counter()
         if request.method == "OPTIONS":
             return "", 204
+        invite_gate_routes = {
+            "/v1/invites/redeem",
+            "/v1/access-code/redeem",
+            "/v1/maintenance/access",
+            "/v1/legal/consent",
+            "/v1/profile",
+        }
+        construction_future = (
+            None
+            if request.path in invite_gate_routes
+            else CHAT_IO_POOL.submit(construction_mode_enabled)
+        )
         user = authenticate()
         if not user:
             return api_error(
@@ -2580,16 +2649,9 @@ def auth_required(handler):
             )
         g.user = user
         g.user_id = user["id"]
-        invite_gate_routes = {
-            "/v1/invites/redeem",
-            "/v1/access-code/redeem",
-            "/v1/maintenance/access",
-            "/v1/legal/consent",
-            "/v1/profile",
-        }
         if (
-            construction_mode_enabled()
-            and request.path not in invite_gate_routes
+            construction_future is not None
+            and construction_future.result()
             and not can_bypass_maintenance(user, user["id"])
         ):
             return api_error(
@@ -3004,6 +3066,11 @@ def redeem_private_beta_access_code():
         },
         prefer="return=minimal",
     )
+    with _request_cache_lock:
+        _beta_access_cache[str(g.user_id)] = (
+            True,
+            time.monotonic() + BETA_ACCESS_CACHE_TTL_SECONDS,
+        )
     return jsonify({"redeemed": True, "label": result.get("label") or "Private beta access"})
 
 
@@ -3071,6 +3138,11 @@ def redeem_beta_invite():
         }
         code = str(result.get("code") or "invalid_invite")
         return api_error(403, code, messages.get(code, "This invitation cannot be used."))
+    with _request_cache_lock:
+        _beta_access_cache[str(g.user_id)] = (
+            True,
+            time.monotonic() + BETA_ACCESS_CACHE_TTL_SECONDS,
+        )
     return jsonify({"redeemed": True, "label": result.get("label") or "Private beta"})
 
 
@@ -3578,6 +3650,11 @@ def update_construction_mode():
         },
         prefer="resolution=merge-duplicates,return=minimal",
     )
+    with _request_cache_lock:
+        _construction_mode_cache.update(
+            value=enabled,
+            expires_at=time.monotonic() + CONSTRUCTION_CACHE_TTL_SECONDS,
+        )
     return jsonify({"enabled": enabled})
 
 
@@ -4605,7 +4682,7 @@ def research_plan():
 @app.route("/v1/chat/stream", methods=["POST", "OPTIONS"])
 @auth_required
 def chat_stream():
-    preflight_started = time.perf_counter()
+    preflight_started = getattr(g, "request_started_at", time.perf_counter())
     payload = request.get_json(silent=True) or {}
     conversation_id = str(payload.get("conversation_id") or "")
     user_text = str(payload.get("message") or "").strip()
@@ -4700,11 +4777,9 @@ def chat_stream():
             "Too many messages were sent at once. Try again in a minute.",
             retryable=True,
         )
-    conversation = get_owned_conversation(conversation_id, g.user_id)
-    if not conversation:
-        return api_error(404, "conversation_not_found", "Conversation not found.")
-    starting_balance = None
-
+    conversation_future = CHAT_IO_POOL.submit(
+        get_owned_conversation, conversation_id, g.user_id
+    )
     profile_future = CHAT_IO_POOL.submit(
         supabase_request,
         "GET",
@@ -4730,6 +4805,10 @@ def chat_stream():
             "limit": "40",
         },
     ) or []
+    conversation = conversation_future.result()
+    if not conversation:
+        return api_error(404, "conversation_not_found", "Conversation not found.")
+    starting_balance = None
     # The database returns newest-first so the capped window contains the latest
     # context; model messages still need chronological order.
     previous.reverse()
