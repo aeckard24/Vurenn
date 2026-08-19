@@ -66,6 +66,35 @@ class SecurityAndMeteringTests(unittest.TestCase):
         fast_model = wsgi.MODEL_CATALOG["vurenn-fast"]["provider_model"]
         self.assertEqual(wsgi.provider_model_attempts(fast_model), [fast_model])
 
+    def test_balanced_everyday_turns_use_the_low_latency_provider(self):
+        fast_model = wsgi.MODEL_CATALOG["vurenn-fast"]["provider_model"]
+        balanced_model = wsgi.MODEL_CATALOG["vurenn"]["provider_model"]
+        self.assertEqual(
+            wsgi.provider_model_for_turn("vurenn", "How are you today?"),
+            fast_model,
+        )
+        self.assertEqual(
+            wsgi.provider_model_for_turn(
+                "vurenn", "Analyze this business plan in detail"
+            ),
+            balanced_model,
+        )
+        self.assertEqual(
+            wsgi.provider_model_for_turn(
+                "vurenn", "What is new?", requested_tools=["web_search"]
+            ),
+            balanced_model,
+        )
+
+    def test_balanced_history_is_bounded_for_low_latency(self):
+        history = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 2000}
+            for index in range(30)
+        ]
+        trimmed = wsgi.trim_conversation_history(history, "vurenn")
+        self.assertLessEqual(len(trimmed), 16)
+        self.assertLessEqual(sum(len(item["content"]) for item in trimmed), 16_000)
+
     def test_credit_balance_lookup_is_only_needed_for_balance_questions(self):
         self.assertFalse(wsgi.credit_balance_requested("Help me write a short email"))
         self.assertTrue(wsgi.credit_balance_requested("How many credits do I have left?"))
@@ -161,7 +190,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(usage["remaining"], 0)
         self.assertEqual(usage["reset_at"], "2026-08-09T21:00:00+00:00")
 
-    def test_basic_chat_limit_blocks_before_conversation_or_provider_work(self):
+    def test_basic_chat_limit_blocks_before_provider_work(self):
         user = {"id": "11111111-1111-1111-1111-111111111111", "email": "guest@example.com"}
         exhausted = {
             "limit": 20,
@@ -173,9 +202,19 @@ class SecurityAndMeteringTests(unittest.TestCase):
         }
         with patch.object(wsgi, "authenticate", return_value=user), patch.object(
             wsgi, "construction_mode_enabled", return_value=False
-        ), patch.object(wsgi, "user_plan", return_value="free"), patch.object(
+        ), patch.object(
             wsgi, "basic_chat_usage", return_value=exhausted
-        ), patch.object(wsgi, "get_owned_conversation") as conversation_lookup:
+        ), patch.object(
+            wsgi,
+            "get_owned_conversation",
+            return_value={
+                "id": "conversation-1",
+                "title": "Existing conversation",
+                "project_id": None,
+            },
+        ) as conversation_lookup, patch.object(
+            wsgi, "supabase_request", return_value=[]
+        ):
             response = wsgi.app.test_client().post(
                 "/v1/chat/stream",
                 json={
@@ -187,7 +226,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.get_json()["code"], "basic_usage_limit_reached")
-        conversation_lookup.assert_not_called()
+        conversation_lookup.assert_called_once()
 
     def test_private_beta_access_code_is_server_validated(self):
         code = "VUR-ABCD-EFGH-JKLM"

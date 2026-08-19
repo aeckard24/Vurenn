@@ -262,6 +262,32 @@ def provider_model_attempts(requested_model):
     return list(dict.fromkeys((requested_model, fallback_model)))
 
 
+_BALANCED_COMPLEX_REQUEST = re.compile(
+    r"\b(?:analy[sz]e|compare|evaluate|investigate|research|debug|architect|"
+    r"strategy|business plan|legal|medical|financial|proof|derive|essay|report|"
+    r"step[- ]by[- ]step|in depth|in detail|thorough|complex|code|program)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def provider_model_for_turn(
+    model_id, user_text, *, requested_tools=None, has_attachments=False
+):
+    """Keep everyday Balanced turns fast without weakening deliberate deep work."""
+    model = MODEL_CATALOG.get(model_id) or MODEL_CATALOG["vurenn"]
+    if model_id != "vurenn":
+        return model["provider_model"]
+    text = str(user_text or "")
+    if (
+        requested_tools
+        or has_attachments
+        or len(text) > 700
+        or _BALANCED_COMPLEX_REQUEST.search(text)
+    ):
+        return model["provider_model"]
+    return MODEL_CATALOG["vurenn-fast"]["provider_model"]
+
+
 def is_provider_capacity_error(error):
     status_code = getattr(error, "status_code", None)
     if status_code in {429, 500, 502, 503, 529}:
@@ -1501,6 +1527,15 @@ def user_plan(user, user_id=None):
     return plan if plan in {"pro", "premier"} else "free"
 
 
+def user_plan_from_profile(user, profile=None):
+    """Resolve chat entitlement from profile data already loaded for the prompt."""
+    profile = profile or {}
+    if is_team(user) and not bool(profile.get("limited_test_mode")):
+        return "premier"
+    plan = (user.get("app_metadata") or {}).get("plan", "free")
+    return plan if plan in {"pro", "premier"} else "free"
+
+
 def user_email(user):
     return str(user.get("email") or "").strip().lower()
 
@@ -1938,9 +1973,9 @@ def adaptive_conversation_prompt(history, recent_user_messages=None):
 def trim_conversation_history(history, model_id):
     """Keep recent context useful without making every turn reprocess a huge chat."""
     limits = {
-        "vurenn-fast": (14, 14_000),
-        "vurenn": (24, 28_000),
-        "vurenn-max": (40, 60_000),
+        "vurenn-fast": (10, 8_000),
+        "vurenn": (16, 16_000),
+        "vurenn-max": (30, 40_000),
     }
     message_limit, character_limit = limits.get(model_id, limits["vurenn"])
     selected = []
@@ -4750,7 +4785,57 @@ def chat_stream():
         )
     if not model:
         return api_error(422, "unknown_model", "That Vurenn mode is unavailable.")
-    effective_plan = user_plan(g.user, g.user_id)
+    if chat_rate_limited(g.user_id):
+        return api_error(
+            429,
+            "rate_limited",
+            "Too many messages were sent at once. Try again in a minute.",
+            retryable=True,
+        )
+    # Fetch every independent chat prerequisite in one network round. The old
+    # path waited for plan/usage first and only then began loading context.
+    conversation_future = CHAT_IO_POOL.submit(
+        get_owned_conversation, conversation_id, g.user_id
+    )
+    profile_future = CHAT_IO_POOL.submit(
+        supabase_request,
+        "GET",
+        "profiles",
+        params={
+            "select": (
+                "display_name,occupation,goals,response_style,"
+                "response_preferences,limited_test_mode"
+            ),
+            "user_id": f"eq.{g.user_id}",
+            "limit": "1",
+        },
+    )
+    history_future = CHAT_IO_POOL.submit(
+        supabase_request,
+        "GET",
+        "messages",
+        params={
+            "select": "role,content",
+            "conversation_id": f"eq.{conversation_id}",
+            "user_id": f"eq.{g.user_id}",
+            "role": "in.(user,assistant)",
+            "order": "created_at.desc",
+            "limit": "40",
+        },
+    )
+    raw_plan = (g.user.get("app_metadata") or {}).get("plan", "free")
+    basic_usage_future = (
+        CHAT_IO_POOL.submit(basic_chat_usage, g.user_id)
+        if not is_team(g.user) and raw_plan not in {"pro", "premier"}
+        else None
+    )
+    conversation = conversation_future.result()
+    if not conversation:
+        return api_error(404, "conversation_not_found", "Conversation not found.")
+    profile_rows = profile_future.result() or []
+    profile = profile_rows[0] if profile_rows else {}
+    previous = history_future.result() or []
+    effective_plan = user_plan_from_profile(g.user, profile)
     if not model_allowed(effective_plan, model):
         return api_error(
             403,
@@ -4758,7 +4843,11 @@ def chat_stream():
             "Vurenn Max requires Premier access.",
         )
     if effective_plan == "free":
-        basic_usage = basic_chat_usage(g.user_id)
+        basic_usage = (
+            basic_usage_future.result()
+            if basic_usage_future is not None
+            else basic_chat_usage(g.user_id)
+        )
         if basic_usage["exhausted"]:
             return api_error(
                 429,
@@ -4770,44 +4859,6 @@ def chat_stream():
                     "upgrade_url": f"{FRONTEND_URL}/pricing",
                 },
             )
-    if chat_rate_limited(g.user_id):
-        return api_error(
-            429,
-            "rate_limited",
-            "Too many messages were sent at once. Try again in a minute.",
-            retryable=True,
-        )
-    conversation_future = CHAT_IO_POOL.submit(
-        get_owned_conversation, conversation_id, g.user_id
-    )
-    profile_future = CHAT_IO_POOL.submit(
-        supabase_request,
-        "GET",
-        "profiles",
-        params={
-            "select": (
-                "display_name,occupation,goals,response_style,"
-                "response_preferences"
-            ),
-            "user_id": f"eq.{g.user_id}",
-            "limit": "1",
-        },
-    )
-    previous = supabase_request(
-        "GET",
-        "messages",
-        params={
-            "select": "role,content",
-            "conversation_id": f"eq.{conversation_id}",
-            "user_id": f"eq.{g.user_id}",
-            "role": "in.(user,assistant)",
-            "order": "created_at.desc",
-            "limit": "40",
-        },
-    ) or []
-    conversation = conversation_future.result()
-    if not conversation:
-        return api_error(404, "conversation_not_found", "Conversation not found.")
     starting_balance = None
     # The database returns newest-first so the capped window contains the latest
     # context; model messages still need chronological order.
@@ -5036,8 +5087,6 @@ def chat_stream():
                 }
             )
     model_messages.append({"role": "user", "content": current_content})
-    profile_rows = profile_future.result() or []
-    profile = profile_rows[0] if profile_rows else {}
     user_context = []
     project = (
         get_owned_project(conversation.get("project_id"), g.user_id)
@@ -5141,10 +5190,22 @@ def chat_stream():
             "lists, headings, tables, or decorative symbols. Avoid URLs and "
             "code unless the user explicitly needs them."
         )
+    turn_provider_model = (
+        MODEL_CATALOG["vurenn-fast"]["provider_model"]
+        if voice_mode
+        else provider_model_for_turn(
+            model_id,
+            user_text,
+            requested_tools=requested_tools,
+            has_attachments=bool(owned_attachments),
+        )
+    )
 
     def prepare_reply_text(value):
         safe_value = sanitize_assistant_text(value)
         return sanitize_voice_text(safe_value) if voice_mode else safe_value
+
+    request_id_for_log = getattr(g, "request_id", "unknown")
 
     def stream():
         full_text = []
@@ -5152,6 +5213,20 @@ def chat_stream():
         usage = {"input_tokens": 0, "output_tokens": 0}
         usage_data = {}
         balance_after = starting_balance
+        first_token_recorded = False
+
+        def record_first_token():
+            nonlocal first_token_recorded
+            if first_token_recorded:
+                return
+            first_token_recorded = True
+            app.logger.info(
+                "chat_first_token request_id=%s model=%s total_ms=%.1f",
+                request_id_for_log,
+                turn_provider_model,
+                (time.perf_counter() - preflight_started) * 1000,
+            )
+
         persistence_futures = persist_user_turn()
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
@@ -5300,11 +5375,7 @@ def chat_stream():
                         },
                     )
                 create_kwargs = {
-                    "model": (
-                        MODEL_CATALOG["vurenn-fast"]["provider_model"]
-                        if voice_mode
-                        else model["provider_model"]
-                    ),
+                    "model": turn_provider_model,
                     "max_tokens": (
                         min(model["max_tokens"], 160)
                         if voice_mode
@@ -5384,6 +5455,7 @@ def chat_stream():
                                 if safe_chunk:
                                     emitted_text = True
                                     full_text.append(safe_chunk)
+                                    record_first_token()
                                     yield sse("token", {"text": safe_chunk})
                         final_message = provider_stream.get_final_message()
                         if not emitted_text:
@@ -5392,6 +5464,7 @@ def chat_stream():
                             )
                             if recovered_text:
                                 full_text.append(recovered_text)
+                                record_first_token()
                                 yield sse("token", {"text": recovered_text})
                         return final_message
 
@@ -5482,11 +5555,7 @@ def chat_stream():
                     )
             else:
                 provider_error = None
-                attempt_models = provider_model_attempts(
-                    MODEL_CATALOG["vurenn-fast"]["provider_model"]
-                    if voice_mode
-                    else model["provider_model"]
-                )
+                attempt_models = provider_model_attempts(turn_provider_model)
                 for attempt, provider_model in enumerate(attempt_models):
                     try:
                         with anthropic_client.messages.stream(
@@ -5499,7 +5568,16 @@ def chat_stream():
                             system=system_prompt,
                             messages=model_messages,
                         ) as response_stream:
+                            emitted_first_text = False
                             for text in response_stream.text_stream:
+                                if text and not emitted_first_text:
+                                    safe_text = prepare_reply_text(text)
+                                    if safe_text:
+                                        emitted_first_text = True
+                                        full_text.append(safe_text)
+                                        record_first_token()
+                                        yield sse("token", {"text": safe_text})
+                                        continue
                                 pending_text += text
                                 stream_chunk_size = (
                                     12 if voice_mode else 18
@@ -5522,6 +5600,7 @@ def chat_stream():
                                     )
                                     pending_text = pending_text[cutoff + 1 :]
                                     full_text.append(safe_text)
+                                    record_first_token()
                                     yield sse(
                                         "token", {"text": safe_text}
                                     )
@@ -5529,6 +5608,7 @@ def chat_stream():
                             if pending_text:
                                 safe_text = prepare_reply_text(pending_text)
                                 full_text.append(safe_text)
+                                record_first_token()
                                 yield sse("token", {"text": safe_text})
                                 pending_text = ""
                         provider_error = None
