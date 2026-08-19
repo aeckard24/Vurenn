@@ -1,6 +1,7 @@
 import unittest
 import base64
 import io
+import threading
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
@@ -9,6 +10,90 @@ from PIL import Image
 
 
 class SecurityAndMeteringTests(unittest.TestCase):
+    def test_authentication_reuses_the_supabase_connection_pool(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "guest@example.com",
+        }
+        with wsgi.app.test_request_context(
+            "/v1/chat/stream",
+            headers={"Authorization": "Bearer test-token"},
+        ), patch.object(wsgi, "supabase_configured", return_value=True), patch.object(
+            wsgi.SUPABASE_HTTP, "get", return_value=response
+        ) as pooled_get, patch(
+            "wsgi.requests.get"
+        ) as unpooled_get:
+            user = wsgi.authenticate()
+        self.assertEqual(user["email"], "guest@example.com")
+        pooled_get.assert_called_once()
+        unpooled_get.assert_not_called()
+
+    def test_fast_model_does_not_retry_the_same_overloaded_provider(self):
+        fast_model = wsgi.MODEL_CATALOG["vurenn-fast"]["provider_model"]
+        self.assertEqual(wsgi.provider_model_attempts(fast_model), [fast_model])
+
+    def test_credit_balance_lookup_is_only_needed_for_balance_questions(self):
+        self.assertFalse(wsgi.credit_balance_requested("Help me write a short email"))
+        self.assertTrue(wsgi.credit_balance_requested("How many credits do I have left?"))
+        self.assertTrue(wsgi.credit_balance_requested("What's my token balance?"))
+
+    def test_chat_stream_starts_before_database_persistence(self):
+        user = {
+            "id": "11111111-1111-1111-1111-111111111111",
+            "email": "guest@example.com",
+        }
+        database_calls = []
+        completed_writes = []
+        release_writes = threading.Event()
+
+        def database(method, path, **kwargs):
+            database_calls.append((method, path))
+            if method == "GET":
+                return []
+            release_writes.wait(timeout=1)
+            completed_writes.append((method, path))
+            return None
+
+        with patch.object(wsgi, "authenticate", return_value=user), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ) as construction_check, patch.object(
+            wsgi, "user_plan", return_value="premier"
+        ), patch.object(
+            wsgi, "get_owned_conversation", return_value={
+                "id": "conversation-1",
+                "title": "Existing conversation",
+                "project_id": None,
+            }
+        ), patch.object(
+            wsgi, "supabase_request", side_effect=database
+        ), patch.object(
+            wsgi, "local_utility_response", return_value="Immediate answer"
+        ), patch.object(wsgi, "get_credit_account") as balance_lookup:
+            response = wsgi.app.test_client().post(
+                "/v1/chat/stream",
+                json={
+                    "conversation_id": "conversation-1",
+                    "message": "Hello",
+                    "model": "vurenn-fast",
+                },
+                headers={"Authorization": "Bearer test-token"},
+                buffered=False,
+            )
+            first_event = next(iter(response.response)).decode("utf-8")
+            writes_completed_before_second_event = list(completed_writes)
+            release_writes.set()
+            remaining = b"".join(response.response).decode("utf-8")
+
+        self.assertIn("event: message_started", first_event)
+        self.assertRegex(response.headers.get("Server-Timing", ""), r"^preflight;dur=\d")
+        self.assertEqual(writes_completed_before_second_event, [])
+        self.assertIn("event: message_completed", remaining)
+        self.assertEqual(construction_check.call_count, 1)
+        balance_lookup.assert_not_called()
+        self.assertEqual(database_calls.count(("POST", "messages")), 2)
+        self.assertEqual(database_calls.count(("PATCH", "conversations")), 1)
+
     def test_mobile_audio_metadata_matches_the_recorded_container(self):
         mobile_audio = b"\x00\x00\x00\x18ftypM4A " + b"audio"
         upload = Mock(mimetype="audio/mp4;codecs=mp4a.40.2")

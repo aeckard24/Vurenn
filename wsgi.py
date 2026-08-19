@@ -17,6 +17,7 @@ import time
 import uuid
 import wave
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -63,6 +64,10 @@ OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "") or OPENAI_IMAG
 OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-tts")
 OPENAI_TRANSCRIBE_MODEL = os.environ.get(
     "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"
+)
+CHAT_IO_POOL = ThreadPoolExecutor(
+    max_workers=max(4, int(os.environ.get("CHAT_IO_WORKERS", "8"))),
+    thread_name_prefix="vurenn-chat-io",
 )
 LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-08")
 GENERATED_IMAGE_BUCKET = os.environ.get(
@@ -252,12 +257,9 @@ MODEL_CATALOG = {
 
 def provider_model_attempts(requested_model):
     fallback_model = MODEL_CATALOG["vurenn-fast"]["provider_model"]
-    attempts = [requested_model]
-    if fallback_model != requested_model:
-        attempts.append(fallback_model)
-    else:
-        attempts.append(requested_model)
-    return attempts
+    # Retrying the exact same overloaded model adds another provider timeout
+    # without creating a real fallback path.
+    return list(dict.fromkeys((requested_model, fallback_model)))
 
 
 def is_provider_capacity_error(error):
@@ -2472,6 +2474,18 @@ def basic_chat_requires_credits(
     )
 
 
+def credit_balance_requested(user_text):
+    return bool(
+        re.search(
+            r"\b(?:credits?|tokens?|balance|usage)\b[\s\S]{0,40}"
+            r"\b(?:left|remain|remaining|have|available|used|spent)\b|"
+            r"\b(?:how many|what(?:'s| is) my)\s+(?:credits?|tokens?)\b",
+            str(user_text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def spend_credits(user_id, amount, feature_id, idempotency_key, metadata=None):
     return supabase_request(
         "POST",
@@ -2521,7 +2535,9 @@ def authenticate():
     token = authorization.removeprefix("Bearer ").strip()
     if not token or not supabase_configured():
         return None
-    response = requests.get(
+    # Reuse the same connection pool as PostgREST calls. Creating a fresh TLS
+    # connection for every authenticated API request noticeably delays chat.
+    response = SUPABASE_HTTP.get(
         f"{SUPABASE_URL}/auth/v1/user",
         headers={
             "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -4589,6 +4605,7 @@ def research_plan():
 @app.route("/v1/chat/stream", methods=["POST", "OPTIONS"])
 @auth_required
 def chat_stream():
+    preflight_started = time.perf_counter()
     payload = request.get_json(silent=True) or {}
     conversation_id = str(payload.get("conversation_id") or "")
     user_text = str(payload.get("message") or "").strip()
@@ -4620,12 +4637,8 @@ def chat_stream():
             else ("chat_max" if model_id == "vurenn-max" else "chat_balanced")
         )
     )
-    if construction_mode_enabled() and not can_bypass_maintenance(g.user, g.user_id):
-        return api_error(
-            503,
-            "under_construction",
-            "Vurenn is under construction and not open to the public yet.",
-        )
+    # auth_required already performs the private-beta/construction gate. Doing
+    # it again here duplicated up to two remote database reads on every turn.
     if voice_mode and not VOICE_ENABLED:
         return api_error(
             503,
@@ -4692,6 +4705,19 @@ def chat_stream():
         return api_error(404, "conversation_not_found", "Conversation not found.")
     starting_balance = None
 
+    profile_future = CHAT_IO_POOL.submit(
+        supabase_request,
+        "GET",
+        "profiles",
+        params={
+            "select": (
+                "display_name,occupation,goals,response_style,"
+                "response_preferences"
+            ),
+            "user_id": f"eq.{g.user_id}",
+            "limit": "1",
+        },
+    )
     previous = supabase_request(
         "GET",
         "messages",
@@ -4860,40 +4886,45 @@ def chat_stream():
                     },
                 )
             raise
-    supabase_request(
-        "POST",
-        "messages",
-        body={
-            "id": user_message_id,
-            "conversation_id": conversation_id,
-            "user_id": g.user_id,
-            "role": "user",
-            "content": user_text,
-            "status": "completed",
-            "attachments": attachments,
-            "created_at": now,
-        },
-        prefer="return=minimal",
-    )
-    supabase_request(
-        "PATCH",
-        "conversations",
-        params={
-            "id": f"eq.{conversation_id}",
-            "user_id": f"eq.{g.user_id}",
-        },
-        body={
-            "updated_at": now,
-            **(
-                {"title": user_text[:80]}
-                if conversation.get("title") == "New conversation"
-                else {}
-            ),
-        },
-        prefer="return=minimal",
-    )
-
     user_id = g.user_id
+
+    def persist_user_turn():
+        message_write = CHAT_IO_POOL.submit(
+            supabase_request,
+            "POST",
+            "messages",
+            body={
+                "id": user_message_id,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "role": "user",
+                "content": user_text,
+                "status": "completed",
+                "attachments": attachments,
+                "created_at": now,
+            },
+            prefer="return=minimal",
+        )
+        conversation_write = CHAT_IO_POOL.submit(
+            supabase_request,
+            "PATCH",
+            "conversations",
+            params={
+                "id": f"eq.{conversation_id}",
+                "user_id": f"eq.{user_id}",
+            },
+            body={
+                "updated_at": now,
+                **(
+                    {"title": user_text[:80]}
+                    if conversation.get("title") == "New conversation"
+                    else {}
+                ),
+            },
+            prefer="return=minimal",
+        )
+        return (message_write, conversation_write)
+
     model_messages = [
         {"role": item["role"], "content": item["content"]}
         for item in previous
@@ -4926,18 +4957,7 @@ def chat_stream():
                 }
             )
     model_messages.append({"role": "user", "content": current_content})
-    profile_rows = supabase_request(
-        "GET",
-        "profiles",
-        params={
-            "select": (
-                "display_name,occupation,goals,response_style,"
-                "response_preferences"
-            ),
-            "user_id": f"eq.{g.user_id}",
-            "limit": "1",
-        },
-    ) or []
+    profile_rows = profile_future.result() or []
     profile = profile_rows[0] if profile_rows else {}
     user_context = []
     project = (
@@ -4966,12 +4986,17 @@ def chat_stream():
         user_context.append(
             f"They prefer {profile['response_style']} responses."
         )
-    account = get_credit_account(g.user_id)
     if is_team(g.user) and not metered:
         credit_context = "This account has unlimited Vurenn team access."
-    else:
+    elif credit_balance_requested(user_text):
+        account = get_credit_account(g.user_id)
         credit_context = (
             f"This account currently has {account['balance']} Vurenn credits."
+        )
+    else:
+        credit_context = (
+            "The user's live Vurenn credit balance was not requested for this turn. "
+            "Do not volunteer or guess a balance."
         )
     active_tool_labels = [
         USAGE_COSTS.get(tool_id, {}).get("label", tool_id.replace("_", " "))
@@ -5048,6 +5073,7 @@ def chat_stream():
         usage = {"input_tokens": 0, "output_tokens": 0}
         usage_data = {}
         balance_after = starting_balance
+        persistence_futures = persist_user_turn()
         yield sse("message_started", {"message_id": assistant_message_id})
         try:
             if silent_response:
@@ -5488,6 +5514,10 @@ def chat_stream():
                             "Could not refund unused reservation for %s",
                             request_id,
                         )
+            # Provider generation and persistence run concurrently. Make sure
+            # the user turn is durable before saving its assistant response.
+            for persistence_future in persistence_futures:
+                persistence_future.result()
             supabase_request(
                 "POST",
                 "messages",
@@ -5574,6 +5604,9 @@ def chat_stream():
         headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
+            "Server-Timing": (
+                f"preflight;dur={(time.perf_counter() - preflight_started) * 1000:.1f}"
+            ),
         },
     )
 
