@@ -1455,7 +1455,10 @@ def research_image_prompt(prompt):
                 "Research only the visible, factual design details needed to "
                 "make this image accurate. Use current web sources where useful. "
                 "Return only a production-ready image prompt. Do not add commentary, "
-                "citations, claims about generation status, or safety disclaimers."
+                "citations, claims about generation status, or safety disclaimers. "
+                "Keep descriptions factual and non-graphic. Avoid vivid depictions "
+                "of violence, gore, or weapons. Focus instead on costumes, poses, "
+                "settings, art style, and composition."
             ),
             messages=[{"role": "user", "content": prompt}],
             tools=[
