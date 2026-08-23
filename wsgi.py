@@ -1434,6 +1434,14 @@ def image_request_subject(prompt):
 
 
 def image_prompt_needs_research(prompt):
+    # Skip research for comic book/superhero requests; OpenAI's safety system
+    # flags fighting scenes anyway, and research just adds graphic language
+    if re.search(
+        r"\b(?:batman|superman|spider-man|wonder woman|deathstroke|comic|superhero|villain|hero|avengers|justice league|x-men)\b",
+        prompt,
+        flags=re.IGNORECASE,
+    ):
+        return False
     return bool(
         re.search(r"\b(?:19|20)\d{2}\b", prompt)
         or re.search(
