@@ -60,7 +60,7 @@ OPENAI_IMAGE_SIZE = os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_TIMEOUT_SECONDS = int(
     os.environ.get("OPENAI_IMAGE_TIMEOUT_SECONDS", "180")
 )
-OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "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") or OPENAI_IMAGE_API_KEY
+OPENAI_VOICE_API_KEY = os.environ.get("OPENAI_VOICE_API_KEY", "") or OPENAI_IMAGE_API_KEY
 OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-tts")
 OPENAI_TRANSCRIBE_MODEL = os.environ.get(
     "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"
@@ -1256,10 +1256,6 @@ def image_provider_error_code(response):
     provider_code = str(error.get("code") or "").lower()
     if provider_code == "moderation_block":
         return "IMAGE_PROVIDER_SAFETY_BLOCK"
-    if response.status_code in {401, 403}:
-        return "IMAGE_PROVIDER_AUTH_ERROR"
-    if provider_code in {"insufficient_quota", "billing_hard_limit_reached"}:
-        return "IMAGE_PROVIDER_QUOTA_ERROR"
     if response.status_code == 429 or response.status_code >= 500:
         return "IMAGE_PROVIDER_BUSY"
     return "IMAGE_PROVIDER_ERROR"
@@ -1435,17 +1431,6 @@ def image_request_subject(prompt):
             f"{year_after_model.group(3)}"
         )
     return subject[:110]
-
-
-def prepare_image_prompt(prompt):
-    """Build the image request locally; never route it through the chat provider."""
-    request_text = re.sub(r"\s+", " ", str(prompt or "")).strip()[:6000]
-    return (
-        "Create one polished, original image from this user request:\n"
-        f"{request_text}\n\n"
-        "Follow the requested subject and style closely. Prioritize accurate visible "
-        "details, natural composition, coherent lighting, and a professional finish."
-    )
 
 
 def update_user_plan(user_id, plan_id):
@@ -5212,7 +5197,7 @@ def chat_stream():
                 usage_data = {}
             elif image_request:
                 subject = image_request_subject(user_text)
-                estimated_seconds = 55
+                estimated_seconds = 70
                 estimated_finish_at = (
                     datetime.now(timezone.utc)
                     + timedelta(seconds=estimated_seconds)
@@ -5237,7 +5222,10 @@ def chat_stream():
                         "estimated_seconds": estimated_seconds,
                     },
                 )
-                image_prompt = prepare_image_prompt(user_text)
+                # Send the user's exact wording straight to OpenAI. No
+                # Anthropic call, no server-side rewriting, no appended
+                # instruction text — only whitespace is trimmed.
+                image_prompt = user_text.strip()
                 yield sse(
                     "tool_progress",
                     {
@@ -5248,38 +5236,11 @@ def chat_stream():
                         "estimated_seconds": max(45, estimated_seconds - 15),
                     },
                 )
-                yield sse(
-                    "tool_progress",
-                    {
-                        "tool_call_id": "image_generation",
-                        "tool_name": "image_generation",
-                        "subject": subject,
-                        "stage_index": 2,
-                        "estimated_seconds": max(35, estimated_seconds - 25),
-                    },
-                )
-                try:
-                    image_bytes = generate_image_bytes(image_prompt)
-                except ImageProviderError as error:
-                    # Prompt research can occasionally add wording that trips a
-                    # provider filter. A benign original request gets one clean
-                    # retry; the provider still evaluates it normally.
-                    if (
-                        error.code == "IMAGE_PROVIDER_SAFETY_BLOCK"
-                        and image_prompt != user_text
-                        and safety_category(user_text) is None
-                    ):
-                        app.logger.info(
-                            "Retrying a benign image request without prompt enrichment"
-                        )
-                        direct_prompt = (
-                            f"Create one polished, original image based on this request: "
-                            f"{user_text[:3000]}. Use a natural composition, coherent "
-                            "lighting, accurate visible details, and a professional finish."
-                        )
-                        image_bytes = generate_image_bytes(direct_prompt)
-                    else:
-                        raise
+                # generate_image_bytes() already retries once internally on a
+                # busy provider response. A safety block is not retried here:
+                # retrying with identical wording would just fail again, and
+                # this app does not alter the prompt to work around it.
+                image_bytes = generate_image_bytes(image_prompt)
                 yield sse(
                     "tool_progress",
                     {
@@ -5679,11 +5640,6 @@ def chat_stream():
                         (
                             "image_safety_blocked"
                             if image_error_code == "IMAGE_PROVIDER_SAFETY_BLOCK"
-                            else "image_provider_configuration_error"
-                            if image_error_code in {
-                                "IMAGE_PROVIDER_AUTH_ERROR",
-                                "IMAGE_PROVIDER_QUOTA_ERROR",
-                            }
                             else "image_provider_busy"
                             if image_error_code == "IMAGE_PROVIDER_BUSY"
                             else "image_generation_failed"
@@ -5701,14 +5657,6 @@ def chat_stream():
                             "Try a non-graphic version without violence, sexual content, "
                             "or a real person's likeness."
                             if image_error_code == "IMAGE_PROVIDER_SAFETY_BLOCK"
-                            else (
-                                "Image generation needs attention from the Vurenn team. "
-                                "Your request was not charged."
-                            )
-                            if image_error_code in {
-                                "IMAGE_PROVIDER_AUTH_ERROR",
-                                "IMAGE_PROVIDER_QUOTA_ERROR",
-                            }
                             else "Image generation is temporarily busy. Please retry in a moment."
                             if image_error_code == "IMAGE_PROVIDER_BUSY"
                             else "Vurenn could not finish that image. Please retry in a moment."
@@ -5720,11 +5668,7 @@ def chat_stream():
                             else "Vurenn could not complete the response."
                         )
                     ),
-                    "retryable": image_error_code not in {
-                        "IMAGE_PROVIDER_SAFETY_BLOCK",
-                        "IMAGE_PROVIDER_AUTH_ERROR",
-                        "IMAGE_PROVIDER_QUOTA_ERROR",
-                    },
+                    "retryable": image_error_code != "IMAGE_PROVIDER_SAFETY_BLOCK",
                 },
             )
         finally:
