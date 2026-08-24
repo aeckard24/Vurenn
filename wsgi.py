@@ -53,7 +53,7 @@ SUPABASE_HTTP.mount(
     "https://",
     HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0),
 )
-OPENAI_IMAGE_API_KEY = os.environ.get("OPENAI_IMAGE_API_KEY", "")
+OPENAI_IMAGE_API_KEY = os.environ.get("OPENAI_IMAGE_API_KEY", "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")
 OPENAI_IMAGE_MODEL = os.environ.get("OPENAI_IMAGE_MODEL", "gpt-image-2")
 OPENAI_IMAGE_QUALITY = os.environ.get("OPENAI_IMAGE_QUALITY", "medium")
 OPENAI_IMAGE_SIZE = os.environ.get("OPENAI_IMAGE_SIZE", "1024x1024")
