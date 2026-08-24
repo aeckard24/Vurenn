@@ -1256,6 +1256,10 @@ def image_provider_error_code(response):
     provider_code = str(error.get("code") or "").lower()
     if provider_code == "moderation_block":
         return "IMAGE_PROVIDER_SAFETY_BLOCK"
+    if response.status_code in {401, 403}:
+        return "IMAGE_PROVIDER_AUTH_ERROR"
+    if provider_code in {"insufficient_quota", "billing_hard_limit_reached"}:
+        return "IMAGE_PROVIDER_QUOTA_ERROR"
     if response.status_code == 429 or response.status_code >= 500:
         return "IMAGE_PROVIDER_BUSY"
     return "IMAGE_PROVIDER_ERROR"
@@ -1433,57 +1437,15 @@ def image_request_subject(prompt):
     return subject[:110]
 
 
-def image_prompt_needs_research(prompt):
-    return bool(
-        re.search(r"\b(?:19|20)\d{2}\b", prompt)
-        or re.search(
-            r"\b(?:accurate|authentic|realistic|specific model|vehicle|product)\b",
-            prompt,
-            flags=re.IGNORECASE,
-        )
+def prepare_image_prompt(prompt):
+    """Build the image request locally; never route it through the chat provider."""
+    request_text = re.sub(r"\s+", " ", str(prompt or "")).strip()[:6000]
+    return (
+        "Create one polished, original image from this user request:\n"
+        f"{request_text}\n\n"
+        "Follow the requested subject and style closely. Prioritize accurate visible "
+        "details, natural composition, coherent lighting, and a professional finish."
     )
-
-
-def research_image_prompt(prompt):
-    if not anthropic_client or not image_prompt_needs_research(prompt):
-        return prompt
-    try:
-        result = anthropic_client.messages.create(
-            model=MODEL_CATALOG["vurenn-fast"]["provider_model"],
-            max_tokens=650,
-            system=(
-                "Research only the visible, factual design details needed to "
-                "make this image accurate. Use current web sources where useful. "
-                "Return only a production-ready image prompt. Do not add commentary, "
-                "citations, claims about generation status, or safety disclaimers."
-            ),
-            messages=[{"role": "user", "content": prompt}],
-            tools=[
-                {
-                    "type": "web_search_20260318",
-                    "name": "web_search",
-                    "max_uses": 2,
-                    "allowed_callers": ["direct"],
-                }
-            ],
-        )
-        text_blocks = []
-        for block in result.content:
-            block_data = (
-                block.model_dump()
-                if hasattr(block, "model_dump")
-                else dict(block)
-            )
-            if block_data.get("type") == "text" and block_data.get("text"):
-                text_blocks.append(str(block_data["text"]).strip())
-        refined = "\n".join(text_blocks).strip()
-        return refined[:6000] if refined else prompt
-    except Exception:
-        app.logger.warning(
-            "Image-reference research failed; using the original prompt",
-            exc_info=True,
-        )
-        return prompt
 
 
 def update_user_plan(user_id, plan_id):
@@ -5250,8 +5212,7 @@ def chat_stream():
                 usage_data = {}
             elif image_request:
                 subject = image_request_subject(user_text)
-                research_needed = image_prompt_needs_research(user_text)
-                estimated_seconds = 90 if research_needed else 70
+                estimated_seconds = 55
                 estimated_finish_at = (
                     datetime.now(timezone.utc)
                     + timedelta(seconds=estimated_seconds)
@@ -5276,7 +5237,7 @@ def chat_stream():
                         "estimated_seconds": estimated_seconds,
                     },
                 )
-                image_prompt = research_image_prompt(user_text)
+                image_prompt = prepare_image_prompt(user_text)
                 yield sse(
                     "tool_progress",
                     {
@@ -5286,11 +5247,6 @@ def chat_stream():
                         "stage_index": 1,
                         "estimated_seconds": max(45, estimated_seconds - 15),
                     },
-                )
-                image_prompt = (
-                    f"{image_prompt}\n\nCreate one polished, original image. "
-                    "Prioritize accurate subject details, natural composition, "
-                    "coherent lighting, and professional finish."
                 )
                 yield sse(
                     "tool_progress",
@@ -5723,6 +5679,11 @@ def chat_stream():
                         (
                             "image_safety_blocked"
                             if image_error_code == "IMAGE_PROVIDER_SAFETY_BLOCK"
+                            else "image_provider_configuration_error"
+                            if image_error_code in {
+                                "IMAGE_PROVIDER_AUTH_ERROR",
+                                "IMAGE_PROVIDER_QUOTA_ERROR",
+                            }
                             else "image_provider_busy"
                             if image_error_code == "IMAGE_PROVIDER_BUSY"
                             else "image_generation_failed"
@@ -5740,6 +5701,14 @@ def chat_stream():
                             "Try a non-graphic version without violence, sexual content, "
                             "or a real person's likeness."
                             if image_error_code == "IMAGE_PROVIDER_SAFETY_BLOCK"
+                            else (
+                                "Image generation needs attention from the Vurenn team. "
+                                "Your request was not charged."
+                            )
+                            if image_error_code in {
+                                "IMAGE_PROVIDER_AUTH_ERROR",
+                                "IMAGE_PROVIDER_QUOTA_ERROR",
+                            }
                             else "Image generation is temporarily busy. Please retry in a moment."
                             if image_error_code == "IMAGE_PROVIDER_BUSY"
                             else "Vurenn could not finish that image. Please retry in a moment."
@@ -5751,7 +5720,11 @@ def chat_stream():
                             else "Vurenn could not complete the response."
                         )
                     ),
-                    "retryable": image_error_code != "IMAGE_PROVIDER_SAFETY_BLOCK",
+                    "retryable": image_error_code not in {
+                        "IMAGE_PROVIDER_SAFETY_BLOCK",
+                        "IMAGE_PROVIDER_AUTH_ERROR",
+                        "IMAGE_PROVIDER_QUOTA_ERROR",
+                    },
                 },
             )
         finally:

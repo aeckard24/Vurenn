@@ -489,6 +489,28 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertNotIn("server-image-key", str(post.call_args.kwargs["json"]))
         store.assert_called_once_with("user-1", b"webp-bytes")
 
+    def test_image_prompt_is_prepared_without_calling_the_chat_provider(self):
+        provider = Mock()
+        with patch.object(wsgi, "anthropic_client", provider):
+            prompt = wsgi.prepare_image_prompt("  A blue mug on a desk  ")
+        self.assertIn("A blue mug on a desk", prompt)
+        provider.messages.create.assert_not_called()
+
+    def test_image_provider_reports_key_and_quota_configuration_errors(self):
+        unauthorized = Mock(status_code=401, json=lambda: {"error": {}})
+        quota = Mock(
+            status_code=429,
+            json=lambda: {"error": {"code": "insufficient_quota"}},
+        )
+        self.assertEqual(
+            wsgi.image_provider_error_code(unauthorized),
+            "IMAGE_PROVIDER_AUTH_ERROR",
+        )
+        self.assertEqual(
+            wsgi.image_provider_error_code(quota),
+            "IMAGE_PROVIDER_QUOTA_ERROR",
+        )
+
     def test_image_generation_classifies_provider_safety_block(self):
         provider_response = Mock(
             status_code=400,
