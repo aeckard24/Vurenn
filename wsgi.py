@@ -5284,22 +5284,11 @@ def chat_stream():
                         "estimated_seconds": estimated_seconds,
                     },
                 )
-                image_prompt = research_image_prompt(user_text)
-                yield sse(
-                    "tool_progress",
-                    {
-                        "tool_call_id": "image_generation",
-                        "tool_name": "image_generation",
-                        "subject": subject,
-                        "stage_index": 1,
-                        "estimated_seconds": max(45, estimated_seconds - 15),
-                    },
+                image_prompt = (
+                    f"{user_text}\n\nCreate one polished, original image. "
+                    "Prioritize accurate subject details, natural composition, "
+                    "coherent lighting, and professional finish."
                 )
-               image_prompt = (
-                            f"{user_text}\n\nCreate one polished, original image. "
-                            "Prioritize accurate subject details, natural composition, "
-                            "coherent lighting, and professional finish."
-)
 yield sse(
     "tool_progress",
     {
@@ -5310,6 +5299,21 @@ yield sse(
         "estimated_seconds": max(45, estimated_seconds - 15),
     },
 )
+                image_prompt = (
+                    f"{image_prompt}\n\nCreate one polished, original image. "
+                    "Prioritize accurate subject details, natural composition, "
+                    "coherent lighting, and professional finish."
+                )
+                yield sse(
+                    "tool_progress",
+                    {
+                        "tool_call_id": "image_generation",
+                        "tool_name": "image_generation",
+                        "subject": subject,
+                        "stage_index": 2,
+                        "estimated_seconds": max(35, estimated_seconds - 25),
+                    },
+                )
                 try:
                     image_bytes = generate_image_bytes(image_prompt)
                 except ImageProviderError as error:
