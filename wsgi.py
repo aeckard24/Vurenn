@@ -1433,59 +1433,6 @@ def image_request_subject(prompt):
     return subject[:110]
 
 
-def image_prompt_needs_research(prompt):
-    return bool(
-        re.search(r"\b(?:19|20)\d{2}\b", prompt)
-        or re.search(
-            r"\b(?:accurate|authentic|realistic|specific model|vehicle|product)\b",
-            prompt,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def research_image_prompt(prompt):
-    if not anthropic_client or not image_prompt_needs_research(prompt):
-        return prompt
-    try:
-        result = anthropic_client.messages.create(
-            model=MODEL_CATALOG["vurenn-fast"]["provider_model"],
-            max_tokens=650,
-            system=(
-                "Research only the visible, factual design details needed to "
-                "make this image accurate. Use current web sources where useful. "
-                "Return only a production-ready image prompt. Do not add commentary, "
-                "citations, claims about generation status, or safety disclaimers."
-            ),
-            messages=[{"role": "user", "content": prompt}],
-            tools=[
-                {
-                    "type": "web_search_20260318",
-                    "name": "web_search",
-                    "max_uses": 2,
-                    "allowed_callers": ["direct"],
-                }
-            ],
-        )
-        text_blocks = []
-        for block in result.content:
-            block_data = (
-                block.model_dump()
-                if hasattr(block, "model_dump")
-                else dict(block)
-            )
-            if block_data.get("type") == "text" and block_data.get("text"):
-                text_blocks.append(str(block_data["text"]).strip())
-        refined = "\n".join(text_blocks).strip()
-        return refined[:6000] if refined else prompt
-    except Exception:
-        app.logger.warning(
-            "Image-reference research failed; using the original prompt",
-            exc_info=True,
-        )
-        return prompt
-
-
 def update_user_plan(user_id, plan_id):
     response = requests.put(
         f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
@@ -5250,8 +5197,7 @@ def chat_stream():
                 usage_data = {}
             elif image_request:
                 subject = image_request_subject(user_text)
-                research_needed = image_prompt_needs_research(user_text)
-                estimated_seconds = 90 if research_needed else 70
+                estimated_seconds = 70
                 estimated_finish_at = (
                     datetime.now(timezone.utc)
                     + timedelta(seconds=estimated_seconds)
@@ -5276,7 +5222,13 @@ def chat_stream():
                         "estimated_seconds": estimated_seconds,
                     },
                 )
-                image_prompt = research_image_prompt(user_text)
+                # Send the user's request straight to OpenAI. No Anthropic
+                # prompt-research pass runs in this path anymore.
+                image_prompt = (
+                    f"{user_text}\n\nCreate one polished, original image. "
+                    "Prioritize accurate subject details, natural composition, "
+                    "coherent lighting, and professional finish."
+                )
                 yield sse(
                     "tool_progress",
                     {
@@ -5287,34 +5239,18 @@ def chat_stream():
                         "estimated_seconds": max(45, estimated_seconds - 15),
                     },
                 )
-                image_prompt = (
-                    f"{image_prompt}\n\nCreate one polished, original image. "
-                    "Prioritize accurate subject details, natural composition, "
-                    "coherent lighting, and professional finish."
-                )
-                yield sse(
-                    "tool_progress",
-                    {
-                        "tool_call_id": "image_generation",
-                        "tool_name": "image_generation",
-                        "subject": subject,
-                        "stage_index": 2,
-                        "estimated_seconds": max(35, estimated_seconds - 25),
-                    },
-                )
                 try:
                     image_bytes = generate_image_bytes(image_prompt)
                 except ImageProviderError as error:
-                    # Prompt research can occasionally add wording that trips a
-                    # provider filter. A benign original request gets one clean
-                    # retry; the provider still evaluates it normally.
+                    # The prompt wrapper text can occasionally trip a provider
+                    # filter on an otherwise benign request. Retry once with a
+                    # minimal, unadorned version of the same request.
                     if (
                         error.code == "IMAGE_PROVIDER_SAFETY_BLOCK"
-                        and image_prompt != user_text
                         and safety_category(user_text) is None
                     ):
                         app.logger.info(
-                            "Retrying a benign image request without prompt enrichment"
+                            "Retrying a benign image request with a minimal prompt"
                         )
                         direct_prompt = (
                             f"Create one polished, original image based on this request: "
