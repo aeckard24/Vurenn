@@ -40,7 +40,7 @@ app.config["MAX_CONTENT_LENGTH"] = int(
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
 ANTHROPIC_MODEL = os.environ.get(
     "ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
