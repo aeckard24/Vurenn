@@ -539,6 +539,20 @@ DEFAULT_JOURNAL_CONTENT = {
     ),
     "updates": [
         {
+            "date": "August 29, 2026",
+            "category": "Developer Workspace",
+            "title": "A focused, multi-language workspace built around the project",
+            "summary": (
+                "Developer Workspace now opens in its own browser tab and replaces "
+                "the crowded layout with focused Code, Preview, Console, Vurenn, "
+                "and Plan views. A skippable project brief creates language-appropriate "
+                "starter files and useful next steps, while the new file creator "
+                "supports common languages plus any custom filename or extension. "
+                "Vurenn now follows each file extension automatically instead of "
+                "forcing every project into HTML, CSS, and JavaScript."
+            ),
+        },
+        {
             "date": "August 19, 2026",
             "category": "Performance",
             "title": "A faster path from send to first word",
