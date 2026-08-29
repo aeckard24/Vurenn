@@ -40,7 +40,7 @@ app.config["MAX_CONTENT_LENGTH"] = int(
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "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")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get(
     "ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"
 )
@@ -538,6 +538,20 @@ DEFAULT_JOURNAL_CONTENT = {
         "decisions, lessons, and introductions to the people doing the work."
     ),
     "updates": [
+        {
+            "date": "August 29, 2026",
+            "category": "Developer Workspace",
+            "title": "A focused, multi-language workspace built around the project",
+            "summary": (
+                "Developer Workspace now opens in its own browser tab and replaces "
+                "the crowded layout with focused Code, Preview, Console, Vurenn, "
+                "and Plan views. A skippable project brief creates language-appropriate "
+                "starter files and useful next steps, while the new file creator "
+                "supports common languages plus any custom filename or extension. "
+                "Vurenn now follows each file extension automatically instead of "
+                "forcing every project into HTML, CSS, and JavaScript."
+            ),
+        },
         {
             "date": "August 19, 2026",
             "category": "Performance",
