@@ -836,6 +836,24 @@ def normalize_journal_content(value):
     }
 
 
+def journal_drafts():
+    value = app_setting_value("journal_drafts", {"items": []})
+    items = value.get("items") if isinstance(value, dict) else []
+    return items if isinstance(items, list) else []
+
+
+def save_journal_drafts(items):
+    save_app_setting("journal_drafts", {"items": items[:100]}, g.user_id)
+
+
+def get_journal_draft(draft_id):
+    drafts = journal_drafts()
+    for index, item in enumerate(drafts):
+        if str(item.get("id")) == str(draft_id):
+            return drafts, index, item
+    return drafts, None, None
+
+
 def journal_content():
     try:
         rows = supabase_request(
@@ -3568,6 +3586,72 @@ def team_journal():
     record_journal_event("published_journal", "Published from Team Journal Editor")
     return jsonify(content)
 
+@app.route("/v1/team/journal/drafts", methods=["GET", "POST", "OPTIONS"])
+@team_required
+def team_journal_drafts():
+    if request.method == "GET":
+        return jsonify({"items": journal_drafts(), "admin": is_admin(g.user)})
+    payload = request.get_json(silent=True) or {}
+    content = normalize_journal_content(payload.get("content") or {})
+    note = str(payload.get("note") or "").strip()[:400]
+    drafts = journal_drafts()
+    item = {
+        "id": str(uuid.uuid4()),
+        "content": content,
+        "note": note,
+        "status": "pending_review",
+        "submitted_by": user_email(g.user),
+        "submitted_by_id": g.user_id,
+        "submitted_at": utc_now(),
+        "updated_at": utc_now(),
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "review_note": None,
+    }
+    drafts.insert(0, item)
+    save_journal_drafts(drafts)
+    record_journal_event(
+        "submitted_journal_draft",
+        note or f"Draft submitted by {user_email(g.user)}",
+    )
+    return jsonify(item), 201
+
+
+@app.route("/v1/team/journal/drafts/<draft_id>", methods=["PATCH", "DELETE", "OPTIONS"])
+@team_required
+def team_journal_draft_item(draft_id):
+    drafts, index, draft = get_journal_draft(draft_id)
+    if draft is None:
+        return api_error(404, "draft_not_found", "That journal draft was not found.")
+    is_owner = draft.get("submitted_by_id") == g.user_id
+    if not is_owner and not is_admin(g.user):
+        return api_error(
+            403, "draft_not_owned",
+            "Only the original author or an admin can modify this draft.",
+        )
+    if draft.get("status") != "pending_review":
+        return api_error(
+            409, "draft_already_reviewed",
+            "This draft has already been reviewed and can no longer be edited.",
+        )
+    if request.method == "DELETE":
+        drafts.pop(index)
+        save_journal_drafts(drafts)
+        record_journal_event(
+            "withdrew_journal_draft",
+            draft.get("note") or f"Draft withdrawn by {user_email(g.user)}",
+        )
+        return "", 204
+    payload = request.get_json(silent=True) or {}
+    if "content" in payload:
+        draft["content"] = normalize_journal_content(payload["content"])
+    if "note" in payload:
+        draft["note"] = str(payload.get("note") or "").strip()[:400]
+    draft["updated_at"] = utc_now()
+    drafts[index] = draft
+    save_journal_drafts(drafts)
+    return jsonify(draft)
+
 
 @app.route("/v1/admin/journal/audit", methods=["GET", "OPTIONS"])
 @admin_required
@@ -3577,6 +3661,63 @@ def admin_journal_audit():
 
 @app.route("/v1/team/workshop", methods=["GET", "POST", "OPTIONS"])
 @team_required
+
+
+@app.route("/v1/admin/journal/drafts", methods=["GET", "OPTIONS"])
+@admin_required
+def admin_journal_drafts():
+    return jsonify({"items": journal_drafts()})
+
+
+@app.route("/v1/admin/journal/drafts/<draft_id>/approve", methods=["PUT", "OPTIONS"])
+@admin_required
+def approve_journal_draft(draft_id):
+    drafts, index, draft = get_journal_draft(draft_id)
+    if draft is None:
+        return api_error(404, "draft_not_found", "That journal draft was not found.")
+    if draft.get("status") != "pending_review":
+        return api_error(409, "draft_already_reviewed", "This draft has already been reviewed.")
+    review_note = str((request.get_json(silent=True) or {}).get("review_note") or "").strip()[:400]
+    save_app_setting("journal_content", draft["content"], g.user_id)
+    draft.update(
+        status="approved",
+        reviewed_by=user_email(g.user),
+        reviewed_at=utc_now(),
+        review_note=review_note,
+    )
+    drafts[index] = draft
+    save_journal_drafts(drafts)
+    record_journal_event(
+        "approved_journal_draft",
+        f"Approved draft from {draft.get('submitted_by')}",
+    )
+    return jsonify(draft)
+
+
+@app.route("/v1/admin/journal/drafts/<draft_id>/reject", methods=["PUT", "OPTIONS"])
+@admin_required
+def reject_journal_draft(draft_id):
+    drafts, index, draft = get_journal_draft(draft_id)
+    if draft is None:
+        return api_error(404, "draft_not_found", "That journal draft was not found.")
+    if draft.get("status") != "pending_review":
+        return api_error(409, "draft_already_reviewed", "This draft has already been reviewed.")
+    review_note = str((request.get_json(silent=True) or {}).get("review_note") or "").strip()[:400]
+    if not review_note:
+        return api_error(422, "review_note_required", "Explain why this draft was not approved.")
+    draft.update(
+        status="rejected",
+        reviewed_by=user_email(g.user),
+        reviewed_at=utc_now(),
+        review_note=review_note,
+    )
+    drafts[index] = draft
+    save_journal_drafts(drafts)
+    record_journal_event(
+        "rejected_journal_draft",
+        f"Rejected draft from {draft.get('submitted_by')}: {review_note}",
+    )
+    return jsonify(draft)
 def team_workshop():
     items = workshop_releases()
     if request.method == "GET":
