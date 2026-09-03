@@ -1035,6 +1035,63 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(content["updates"][0]["title"], "A real update")
         self.assertEqual(content["team"][0]["name"], "Kendric")
 
+    def test_journal_review_board_rejects_untrusted_social_links(self):
+        content = wsgi.normalize_journal_content(
+            {
+                "social": {
+                    "facebook": "https://example.com/not-facebook",
+                    "instagram": "javascript:alert(1)",
+                },
+                "reviews": [
+                    {
+                        "author": "A customer",
+                        "quote": "Helpful and clear.",
+                        "rating": 9,
+                        "source": "facebook",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(content["social"]["facebook"], "")
+        self.assertEqual(content["social"]["instagram"], "")
+        self.assertEqual(content["reviews"][0]["rating"], 5)
+        self.assertEqual(content["reviews"][0]["source"], "facebook")
+
+    def test_developer_execution_uses_owned_project_and_selected_entrypoint(self):
+        runtime_response = Mock()
+        runtime_response.raise_for_status.return_value = None
+        runtime_response.json.return_value = {
+            "language": "python",
+            "version": "3.12.0",
+            "run": {"stdout": "hello\n", "stderr": "", "output": "hello\n", "code": 0},
+        }
+        with wsgi.app.test_request_context(
+            "/v1/developer/execute",
+            method="POST",
+            json={
+                "project_id": "project-1",
+                "language": "python",
+                "entrypoint": "main.py",
+                "files": [
+                    {"name": "helper.py", "content": "VALUE = 'hello'"},
+                    {"name": "main.py", "content": "from helper import VALUE\nprint(VALUE)"},
+                ],
+            },
+        ), patch.object(wsgi, "CODE_RUNNER_URL", "https://runner.example/api/v2"), patch.object(
+            wsgi, "runner_rate_limited", return_value=False
+        ), patch.object(
+            wsgi, "get_owned_project", return_value={"id": "project-1"}
+        ), patch.object(
+            wsgi, "code_runner_runtimes", return_value=[{"language": "python", "version": "3.12.0", "aliases": ["py"]}]
+        ), patch.object(wsgi.requests, "post", return_value=runtime_response) as runner:
+            wsgi.g.user_id = "user-1"
+            response = wsgi.developer_execute.__wrapped__()
+
+        body = response.get_json()
+        self.assertEqual(body["run"]["stdout"], "hello\n")
+        self.assertEqual(runner.call_args.kwargs["json"]["files"][0]["name"], "main.py")
+        self.assertEqual(runner.call_args.kwargs["json"]["run_timeout"], 5000)
+
     def test_conversation_delete_is_scoped_to_its_owner(self):
         with wsgi.app.test_request_context(
             "/v1/conversations/conversation-1",

@@ -65,6 +65,17 @@ OPENAI_VOICE_MODEL = os.environ.get("OPENAI_VOICE_MODEL", "gpt-4o-mini-tts")
 OPENAI_TRANSCRIBE_MODEL = os.environ.get(
     "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"
 )
+CODE_RUNNER_URL = os.environ.get("CODE_RUNNER_URL", "").rstrip("/")
+CODE_RUNNER_TOKEN = os.environ.get("CODE_RUNNER_TOKEN", "")
+CODE_RUNNER_TIMEOUT_SECONDS = int(os.environ.get("CODE_RUNNER_TIMEOUT_SECONDS", "20"))
+FACEBOOK_PAGE_URL = os.environ.get(
+    "FACEBOOK_PAGE_URL",
+    "https://www.facebook.com/people/Vurenn-AI/61592711165046/",
+)
+FACEBOOK_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "61592711165046")
+INSTAGRAM_PAGE_URL = os.environ.get("INSTAGRAM_PAGE_URL", "")
+META_PAGE_ACCESS_TOKEN = os.environ.get("META_PAGE_ACCESS_TOKEN", "")
+META_GRAPH_VERSION = os.environ.get("META_GRAPH_VERSION", "v23.0")
 CHAT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(4, int(os.environ.get("CHAT_IO_WORKERS", "8"))),
     thread_name_prefix="vurenn-chat-io",
@@ -309,10 +320,12 @@ _rate_limit_lock = threading.Lock()
 _chat_requests = defaultdict(deque)
 _tts_requests = defaultdict(deque)
 _access_code_requests = defaultdict(deque)
+_runner_requests = defaultdict(deque)
 _request_cache_lock = threading.Lock()
 _auth_cache = {}
 _beta_access_cache = {}
 _construction_mode_cache = {"value": False, "expires_at": 0.0}
+_facebook_reviews_cache = {"value": [], "expires_at": 0.0}
 AUTH_CACHE_TTL_SECONDS = float(os.environ.get("AUTH_CACHE_TTL_SECONDS", "30"))
 BETA_ACCESS_CACHE_TTL_SECONDS = float(
     os.environ.get("BETA_ACCESS_CACHE_TTL_SECONDS", "300")
@@ -537,7 +550,28 @@ DEFAULT_JOURNAL_CONTENT = {
         "This is the public record of Vurenn's progress: product updates, "
         "decisions, lessons, and introductions to the people doing the work."
     ),
+    "social": {
+        "facebook": FACEBOOK_PAGE_URL,
+        "instagram": INSTAGRAM_PAGE_URL,
+    },
+    "reviews": [],
     "updates": [
+        {
+            "date": "September 2, 2026",
+            "category": "Projects & Community",
+            "title": "Runnable project workspaces and a public review board",
+            "summary": (
+                "Project requests can now open a dedicated Developer Workspace "
+                "with the project brief, suggested stack, starter files, to-do "
+                "plan, and conversation context already connected. Browser "
+                "projects keep their instant preview, while Python and other "
+                "installed languages run through a separate isolated execution "
+                "service. The public journal also adds a moderated community "
+                "review board linked to Vurenn's official Facebook page, with "
+                "optional Instagram linking and automatic Facebook review "
+                "synchronization when the Page integration is authorized."
+            ),
+        },
         {
             "date": "August 29, 2026",
             "category": "Developer Workspace",
@@ -835,8 +869,45 @@ def normalize_journal_content(value):
                 normalized.append(item)
         return normalized
 
+    social_source = source.get("social") if isinstance(source.get("social"), dict) else {}
+
+    def social_url(key, fallback):
+        value = str(social_source.get(key) or fallback or "").strip()[:500]
+        parsed = urlparse(value)
+        allowed = {
+            "facebook": {"facebook.com", "www.facebook.com"},
+            "instagram": {"instagram.com", "www.instagram.com"},
+        }
+        return value if parsed.scheme == "https" and parsed.netloc.lower() in allowed[key] else ""
+
+    reviews = []
+    source_reviews = source.get("reviews")
+    if isinstance(source_reviews, list):
+        for row in source_reviews[:30]:
+            if not isinstance(row, dict):
+                continue
+            quote_text = str(row.get("quote") or "").strip()[:600]
+            if not quote_text:
+                continue
+            rating = row.get("rating")
+            source_name = "facebook" if row.get("source") == "facebook" else "direct"
+            reviews.append({
+                "id": str(row.get("id") or uuid.uuid4())[:100],
+                "author": str(row.get("author") or "Vurenn user").strip()[:80],
+                "quote": quote_text,
+                "rating": max(1, min(5, int(rating))) if str(rating).isdigit() else None,
+                "date": str(row.get("date") or "").strip()[:40],
+                "source": source_name,
+                "source_url": social_url("facebook", FACEBOOK_PAGE_URL) if source_name == "facebook" else "",
+            })
+
     return {
         "intro": intro,
+        "social": {
+            "facebook": social_url("facebook", FACEBOOK_PAGE_URL),
+            "instagram": social_url("instagram", INSTAGRAM_PAGE_URL),
+        },
+        "reviews": reviews,
         "updates": normalize_rows(
             "updates",
             {"date": 40, "category": 40, "title": 120, "summary": 500},
@@ -848,6 +919,52 @@ def normalize_journal_content(value):
             12,
         ),
     }
+
+
+def facebook_reviews():
+    if not META_PAGE_ACCESS_TOKEN or not FACEBOOK_PAGE_ID:
+        return []
+    now = time.monotonic()
+    with _request_cache_lock:
+        if _facebook_reviews_cache["expires_at"] > now:
+            return [dict(item) for item in _facebook_reviews_cache["value"]]
+    try:
+        response = requests.get(
+            f"https://graph.facebook.com/{META_GRAPH_VERSION}/{quote(FACEBOOK_PAGE_ID)}/ratings",
+            headers={"Authorization": f"Bearer {META_PAGE_ACCESS_TOKEN}"},
+            params={"fields": "created_time,reviewer,rating,review_text,recommendation_type", "limit": 25},
+            timeout=12,
+        )
+        response.raise_for_status()
+        rows = response.json().get("data", [])
+    except (requests.RequestException, ValueError):
+        app.logger.warning("Facebook review synchronization is unavailable")
+        with _request_cache_lock:
+            return [dict(item) for item in _facebook_reviews_cache["value"]]
+    reviews = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        quote_text = str(row.get("review_text") or "").strip()[:600]
+        if not quote_text:
+            continue
+        reviewer = row.get("reviewer") if isinstance(row.get("reviewer"), dict) else {}
+        rating = row.get("rating")
+        if rating is None and row.get("recommendation_type"):
+            rating = 5 if str(row.get("recommendation_type")).lower() == "positive" else 1
+        reviews.append({
+            "id": f"facebook-{str(row.get('id') or hashlib.sha256(quote_text.encode()).hexdigest())[:80]}",
+            "author": str(reviewer.get("name") or "Facebook reviewer")[:80],
+            "quote": quote_text,
+            "rating": max(1, min(5, int(rating))) if str(rating).isdigit() else None,
+            "date": str(row.get("created_time") or "")[:40],
+            "source": "facebook",
+            "source_url": FACEBOOK_PAGE_URL,
+        })
+    with _request_cache_lock:
+        _facebook_reviews_cache["value"] = reviews
+        _facebook_reviews_cache["expires_at"] = now + 300
+    return reviews
 
 
 def journal_content():
@@ -876,10 +993,18 @@ def journal_content():
             for person in content["team"]:
                 if person.get("name") in {"Andrew", "Andrew Eckard"}:
                     person.update(DEFAULT_JOURNAL_CONTENT["team"][0])
+            synced_reviews = facebook_reviews()
+            seen_reviews = {item.get("id") for item in synced_reviews}
+            content["reviews"] = [
+                *synced_reviews,
+                *[item for item in content["reviews"] if item.get("id") not in seen_reviews],
+            ][:30]
             return content
     except Exception:
         app.logger.exception("Could not read journal content")
-    return normalize_journal_content(DEFAULT_JOURNAL_CONTENT)
+    content = normalize_journal_content(DEFAULT_JOURNAL_CONTENT)
+    content["reviews"] = facebook_reviews()
+    return content
 
 
 def app_setting_value(key, default):
@@ -2197,6 +2322,18 @@ def access_code_rate_limited(key):
         while bucket and now - bucket[0] >= 600:
             bucket.popleft()
         if len(bucket) >= 12:
+            return True
+        bucket.append(now)
+    return False
+
+
+def runner_rate_limited(user_id):
+    now = time.monotonic()
+    with _rate_limit_lock:
+        bucket = _runner_requests[user_id]
+        while bucket and now - bucket[0] >= 60:
+            bucket.popleft()
+        if len(bucket) >= 10:
             return True
         bucket.append(now)
     return False
@@ -4398,6 +4535,145 @@ def project_item(project_id):
         prefer="return=representation",
     )
     return jsonify(serialize_project(updated[0]))
+
+
+RUNNER_LANGUAGE_ALIASES = {
+    "javascript": "javascript", "jsx": "javascript", "typescript": "typescript",
+    "tsx": "typescript", "python": "python", "shell": "bash", "powershell": "powershell",
+    "c": "c", "cpp": "c++", "csharp": "csharp", "java": "java", "go": "go",
+    "rust": "rust", "php": "php", "ruby": "ruby", "swift": "swift",
+    "kotlin": "kotlin", "dart": "dart", "r": "rscript", "lua": "lua",
+    "scala": "scala", "elixir": "elixir", "erlang": "erlang", "fsharp": "fsharp.net",
+    "groovy": "groovy", "sql": "sqlite3", "haskell": "haskell", "julia": "julia",
+    "perl": "perl", "zig": "zig", "fortran": "fortran", "cobol": "cobol",
+}
+
+
+def code_runner_headers():
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if CODE_RUNNER_TOKEN:
+        headers["Authorization"] = f"Bearer {CODE_RUNNER_TOKEN}"
+    return headers
+
+
+def code_runner_runtimes():
+    if not CODE_RUNNER_URL:
+        return []
+    response = requests.get(
+        f"{CODE_RUNNER_URL}/runtimes",
+        headers=code_runner_headers(),
+        timeout=min(CODE_RUNNER_TIMEOUT_SECONDS, 15),
+    )
+    response.raise_for_status()
+    values = response.json()
+    return values if isinstance(values, list) else []
+
+
+def normalize_runner_stage(value):
+    source = value if isinstance(value, dict) else {}
+    return {
+        "stdout": str(source.get("stdout") or "")[:20000],
+        "stderr": str(source.get("stderr") or "")[:20000],
+        "output": str(source.get("output") or "")[:20000],
+        "code": source.get("code") if isinstance(source.get("code"), int) else None,
+        "signal": str(source.get("signal"))[:80] if source.get("signal") else None,
+    }
+
+
+@app.route("/v1/developer/runtimes", methods=["GET", "OPTIONS"])
+@auth_required
+def developer_runtimes():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not CODE_RUNNER_URL:
+        return jsonify({"configured": False, "runtimes": []})
+    try:
+        values = code_runner_runtimes()
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Could not read code runner runtimes")
+        return api_error(502, "runner_unavailable", "The isolated code runner is unavailable.")
+    runtimes = []
+    for value in values[:200]:
+        if not isinstance(value, dict):
+            continue
+        runtimes.append({
+            "language": str(value.get("language") or "")[:40],
+            "version": str(value.get("version") or "")[:40],
+            "aliases": [str(alias)[:40] for alias in value.get("aliases", [])[:20]],
+        })
+    return jsonify({"configured": True, "runtimes": runtimes})
+
+
+@app.route("/v1/developer/execute", methods=["POST", "OPTIONS"])
+@auth_required
+def developer_execute():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not CODE_RUNNER_URL:
+        return api_error(503, "runner_not_configured", "The isolated code runner has not been connected yet.")
+    if runner_rate_limited(g.user_id):
+        return api_error(429, "runner_rate_limited", "Wait a moment before running more code.")
+    payload = request.get_json(silent=True) or {}
+    project_id = str(payload.get("project_id") or "").strip() or None
+    if project_id and not get_owned_project(project_id, g.user_id):
+        return api_error(404, "project_not_found", "Project not found.")
+    requested_language = str(payload.get("language") or "").strip().lower()
+    language = RUNNER_LANGUAGE_ALIASES.get(requested_language, requested_language)
+    entrypoint = str(payload.get("entrypoint") or "").strip()
+    raw_files = payload.get("files")
+    if not language or not entrypoint or not isinstance(raw_files, list):
+        return api_error(422, "invalid_runner_request", "Choose a language, entry file, and project files.")
+    files = []
+    total_size = 0
+    for raw_file in raw_files[:40]:
+        if not isinstance(raw_file, dict):
+            continue
+        name = str(raw_file.get("name") or "").strip().replace("\\", "/")[:100]
+        content = str(raw_file.get("content") or "")
+        if not name or ".." in name or not re.fullmatch(r"[A-Za-z0-9_./+@ -]+", name):
+            return api_error(422, "invalid_runner_filename", "A project filename is invalid.")
+        total_size += len(content.encode("utf-8"))
+        if total_size > 250000:
+            return api_error(413, "runner_project_too_large", "The runnable project is larger than 250 KB.")
+        files.append({"name": name, "content": content})
+    if not files or entrypoint not in {item["name"] for item in files}:
+        return api_error(422, "runner_entrypoint_missing", "The selected entry file is missing.")
+    files = sorted(files, key=lambda item: item["name"] != entrypoint)
+    try:
+        runtimes = code_runner_runtimes()
+        runtime = next((item for item in runtimes if language in {str(item.get("language") or ""), *[str(alias) for alias in item.get("aliases", [])]}), None)
+        if not runtime:
+            return api_error(422, "runtime_not_installed", f"The {requested_language or language} runtime is not installed on the runner.")
+        response = requests.post(
+            f"{CODE_RUNNER_URL}/execute",
+            headers=code_runner_headers(),
+            json={
+                "language": runtime.get("language"),
+                "version": runtime.get("version"),
+                "files": files,
+                "stdin": str(payload.get("stdin") or "")[:10000],
+                "run_timeout": 5000,
+                "run_cpu_time": 5000,
+                "compile_timeout": 10000,
+                "compile_cpu_time": 10000,
+            },
+            timeout=CODE_RUNNER_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.Timeout:
+        return api_error(504, "runner_timeout", "The isolated code run timed out.")
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Code runner request failed")
+        return api_error(502, "runner_unavailable", "The isolated code runner could not complete this run.")
+    body = {
+        "language": str(runtime.get("language") or language),
+        "version": str(runtime.get("version") or ""),
+        "run": normalize_runner_stage(result.get("run")),
+    }
+    if result.get("compile") is not None:
+        body["compile"] = normalize_runner_stage(result.get("compile"))
+    return jsonify(body)
 
 
 ALLOWED_FILE_TYPES = {
