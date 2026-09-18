@@ -1121,6 +1121,14 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(wsgi.PROJECT_LIMITS["pro"], 50)
         self.assertIsNone(wsgi.PROJECT_LIMITS["premier"])
 
+    def test_axiom_uses_premium_reasoning_and_is_paid_only(self):
+        axiom = wsgi.MODEL_CATALOG["vurenn-axiom"]
+        self.assertEqual(axiom["provider_model"], wsgi.ANTHROPIC_PREMIUM_MODEL)
+        self.assertFalse(wsgi.model_allowed("free", axiom))
+        self.assertTrue(wsgi.model_allowed("pro", axiom))
+        self.assertTrue(wsgi.model_allowed("premier", axiom))
+        self.assertEqual(wsgi.provider_model_for_turn("vurenn-axiom", "derive this"), wsgi.ANTHROPIC_PREMIUM_MODEL)
+
     def test_project_lookup_is_scoped_to_its_owner(self):
         with patch.object(
             wsgi,

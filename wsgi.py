@@ -249,6 +249,23 @@ MODEL_CATALOG = {
             "to be useful while staying focused."
         ),
     },
+    "vurenn-axiom": {
+        "provider_model": ANTHROPIC_PREMIUM_MODEL,
+        "required_plan": "pro",
+        "input_usd_per_million": 5.0,
+        "output_usd_per_million": 25.0,
+        "base_credits": 180,
+        "max_tokens": 4500,
+        "style": (
+            "Use higher-performance reasoning for difficult problems. Check "
+            "assumptions, dimensions, algebra, intermediate results, and the "
+            "final conclusion before answering. For mathematics, render "
+            "important equations in LaTeX using $$...$$ on separate lines "
+            "and inline symbols with $...$. Explain each variable and each "
+            "meaningful transformation in clear prose. Do not claim a proof "
+            "or verification that was not actually performed."
+        ),
+    },
     "vurenn-max": {
         "provider_model": ANTHROPIC_PREMIUM_MODEL,
         "required_plan": "premier",
@@ -557,6 +574,20 @@ DEFAULT_JOURNAL_CONTENT = {
     "reviews": [],
     "updates": [
         {
+            "date": "September 18, 2026",
+            "category": "Intelligence & Interface",
+            "title": "Vurenn Axiom and Equation View",
+            "summary": (
+                "Vurenn Axiom adds a higher-performance Pro and Premier mode "
+                "for difficult reasoning, complex mathematics, science, and "
+                "code. Equation View typesets mathematical notation in chat "
+                "instead of exposing raw markup, with mobile-friendly long "
+                "formulas. Logo contrast now follows light or dark appearance, "
+                "and the mobile header has more room. Basic retains its "
+                "rolling message limit and cannot use the premium mode."
+            ),
+        },
+        {
             "date": "September 2, 2026",
             "category": "Projects & Community",
             "title": "Runnable project workspaces and a public review board",
@@ -780,6 +811,9 @@ RESPONSE_CRAFT_PROMPT = (
     "cheapest credible next experiment. Avoid canned praise, filler, and choppy fragments. "
     "When live research is used, place each citation immediately after the sentence or "
     "claim it supports rather than collecting unsupported links at the end. "
+    "When presenting complex mathematics, typeset key equations with LaTeX "
+    "display delimiters $$...$$ and inline notation with $...$. Explain "
+    "the steps and verify algebra rather than dumping raw symbols. "
 )
 
 PROJECT_INTELLIGENCE_PROMPT = (
@@ -2076,6 +2110,7 @@ def trim_conversation_history(history, model_id):
     limits = {
         "vurenn-fast": (10, 8_000),
         "vurenn": (16, 16_000),
+        "vurenn-axiom": (30, 40_000),
         "vurenn-max": (30, 40_000),
     }
     message_limit, character_limit = limits.get(model_id, limits["vurenn"])
@@ -3656,6 +3691,7 @@ def admin_config():
                     "name": {
                         "vurenn-fast": "Vurenn Fast",
                         "vurenn": "Vurenn",
+                        "vurenn-axiom": "Vurenn Axiom",
                         "vurenn-max": "Vurenn Max",
                     }[model_id],
                     "required_plan": details["required_plan"],
@@ -4254,6 +4290,14 @@ def models():
                     "status": "available" if available else "unavailable",
                     "required_plan": "free",
                     "capabilities": ["chat"],
+                },
+                {
+                    "id": "vurenn-axiom",
+                    "name": "Vurenn Axiom",
+                    "description": "Higher-performance reasoning for complex math, science, code, and careful problem solving.",
+                    "status": "available" if available else "unavailable",
+                    "required_plan": "pro",
+                    "capabilities": ["chat", "advanced_reasoning", "math"],
                 },
                 {
                     "id": "vurenn-max",
@@ -4998,7 +5042,7 @@ def chat_stream():
         else (
             "chat_fast"
             if model_id == "vurenn-fast"
-            else ("chat_max" if model_id == "vurenn-max" else "chat_balanced")
+            else ("chat_max" if model_id in {"vurenn-max", "vurenn-axiom"} else "chat_balanced")
         )
     )
     # auth_required already performs the private-beta/construction gate. Doing
@@ -5092,7 +5136,8 @@ def chat_stream():
         return api_error(
             403,
             "plan_required",
-            "Vurenn Max requires Premier access.",
+            "Vurenn Axiom requires Pro access." if model_id == "vurenn-axiom"
+            else "Vurenn Max requires Premier access.",
         )
     if effective_plan == "free":
         basic_usage = (
