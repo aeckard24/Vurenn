@@ -190,6 +190,20 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(usage["remaining"], 0)
         self.assertEqual(usage["reset_at"], "2026-08-09T21:00:00+00:00")
 
+    def test_basic_usage_window_clears_after_reset(self):
+        now = datetime(2026, 8, 9, 21, 0, 1, tzinfo=timezone.utc)
+        with patch.object(wsgi, "supabase_request", return_value=[]) as database:
+            usage = wsgi.basic_chat_usage("11111111-1111-1111-1111-111111111111", now=now)
+
+        self.assertFalse(usage["exhausted"])
+        self.assertEqual(usage["used"], 0)
+        self.assertEqual(usage["remaining"], wsgi.FREE_CHAT_MESSAGES_PER_WINDOW)
+        self.assertIsNone(usage["reset_at"])
+        self.assertEqual(
+            database.call_args.kwargs["params"]["created_at"],
+            "gte.2026-08-09T16:00:01+00:00",
+        )
+
     def test_basic_chat_limit_blocks_before_provider_work(self):
         user = {"id": "11111111-1111-1111-1111-111111111111", "email": "guest@example.com"}
         exhausted = {
@@ -1091,6 +1105,50 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(body["run"]["stdout"], "hello\n")
         self.assertEqual(runner.call_args.kwargs["json"]["files"][0]["name"], "main.py")
         self.assertEqual(runner.call_args.kwargs["json"]["run_timeout"], 5000)
+
+    def test_developer_execution_uses_known_runtimes_when_check_temporarily_fails(self):
+        runtime_response = Mock()
+        runtime_response.raise_for_status.return_value = None
+        runtime_response.json.return_value = {"run": {"output": "ok", "code": 0}}
+        known = [{"language": "python", "version": "3.12.0", "aliases": []}]
+        with wsgi.app.test_request_context(
+            "/v1/developer/execute", method="POST",
+            json={"language": "python", "entrypoint": "main.py", "files": [{"name": "main.py", "content": "print('ok')"}]},
+        ), patch.object(wsgi, "CODE_RUNNER_URL", "https://runner.example/api/v2"), patch.object(
+            wsgi, "runner_rate_limited", return_value=False
+        ), patch.object(
+            wsgi, "code_runner_runtimes", side_effect=wsgi.requests.ConnectionError("temporary")
+        ), patch.dict(wsgi._runner_runtime_cache, {"values": known, "expires_at": 0}), patch.object(
+            wsgi.requests, "post", return_value=runtime_response
+        ) as runner:
+            wsgi.g.user_id = "user-1"
+            response = wsgi.developer_execute.__wrapped__()
+
+        self.assertEqual(response.get_json()["run"]["output"], "ok")
+        runner.assert_called_once()
+
+    def test_developer_execution_uses_managed_fallback_without_private_runner(self):
+        runtime_response = Mock()
+        runtime_response.raise_for_status.return_value = None
+        runtime_response.json.return_value = {
+            "status": "0", "program_output": "fallback works\n",
+            "program_error": "", "compiler_output": "", "compiler_error": "", "signal": "",
+        }
+        runtimes = [{"language": "python", "version": "3.13.8", "aliases": [], "compiler": "cpython-3.13.8"}]
+        with wsgi.app.test_request_context(
+            "/v1/developer/execute", method="POST",
+            json={"language": "python", "entrypoint": "main.py", "files": [{"name": "main.py", "content": "print('fallback works')"}]},
+        ), patch.object(wsgi, "CODE_RUNNER_URL", ""), patch.object(
+            wsgi, "runner_rate_limited", return_value=False
+        ), patch.object(wsgi, "code_runner_runtimes", return_value=runtimes), patch.object(
+            wsgi.requests, "post", return_value=runtime_response
+        ) as runner:
+            wsgi.g.user_id = "user-1"
+            response = wsgi.developer_execute.__wrapped__()
+
+        self.assertEqual(response.get_json()["run"]["output"], "fallback works\n")
+        self.assertEqual(runner.call_args.args[0], "https://wandbox.org/api/compile.json")
+        self.assertEqual(runner.call_args.kwargs["json"]["compiler"], "cpython-3.13.8")
 
     def test_conversation_delete_is_scoped_to_its_owner(self):
         with wsgi.app.test_request_context(

@@ -68,6 +68,7 @@ OPENAI_TRANSCRIBE_MODEL = os.environ.get(
 CODE_RUNNER_URL = os.environ.get("CODE_RUNNER_URL", "").rstrip("/")
 CODE_RUNNER_TOKEN = os.environ.get("CODE_RUNNER_TOKEN", "")
 CODE_RUNNER_TIMEOUT_SECONDS = int(os.environ.get("CODE_RUNNER_TIMEOUT_SECONDS", "20"))
+WANDBOX_API_URL = os.environ.get("WANDBOX_API_URL", "https://wandbox.org/api").rstrip("/")
 FACEBOOK_PAGE_URL = os.environ.get(
     "FACEBOOK_PAGE_URL",
     "https://www.facebook.com/people/Vurenn-AI/61592711165046/",
@@ -4600,17 +4601,56 @@ def code_runner_headers():
     return headers
 
 
+_runner_runtime_cache = {"values": [], "expires_at": 0.0}
+
+
 def code_runner_runtimes():
-    if not CODE_RUNNER_URL:
-        return []
-    response = requests.get(
-        f"{CODE_RUNNER_URL}/runtimes",
-        headers=code_runner_headers(),
-        timeout=min(CODE_RUNNER_TIMEOUT_SECONDS, 15),
-    )
+    now = time.monotonic()
+    if _runner_runtime_cache["values"] and now < _runner_runtime_cache["expires_at"]:
+        return _runner_runtime_cache["values"]
+    if CODE_RUNNER_URL:
+        response = requests.get(
+            f"{CODE_RUNNER_URL}/runtimes",
+            headers=code_runner_headers(),
+            timeout=min(CODE_RUNNER_TIMEOUT_SECONDS, 15),
+        )
+    else:
+        response = requests.get(
+            f"{WANDBOX_API_URL}/list.json",
+            headers={"Accept": "application/json"},
+            timeout=min(CODE_RUNNER_TIMEOUT_SECONDS, 15),
+        )
     response.raise_for_status()
     values = response.json()
-    return values if isinstance(values, list) else []
+    values = values if isinstance(values, list) else []
+    if not CODE_RUNNER_URL:
+        normalized = []
+        seen = set()
+        language_names = {
+            "python": "python", "javascript": "javascript", "typescript": "typescript",
+            "c": "c", "c++": "c++", "java": "java", "go": "go", "rust": "rust",
+            "ruby": "ruby", "php": "php", "lua": "lua", "perl": "perl",
+            "haskell": "haskell", "julia": "julia", "swift": "swift",
+        }
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            language = language_names.get(str(value.get("language") or "").lower())
+            compiler = str(value.get("name") or "")
+            if not language or not compiler or language in seen:
+                continue
+            seen.add(language)
+            normalized.append({
+                "language": language,
+                "version": str(value.get("version") or "latest"),
+                "aliases": [],
+                "compiler": compiler,
+            })
+        values = normalized
+    if values:
+        _runner_runtime_cache["values"] = values
+        _runner_runtime_cache["expires_at"] = now + 60
+    return values
 
 
 def normalize_runner_stage(value):
@@ -4629,8 +4669,6 @@ def normalize_runner_stage(value):
 def developer_runtimes():
     if request.method == "OPTIONS":
         return "", 204
-    if not CODE_RUNNER_URL:
-        return jsonify({"configured": False, "runtimes": []})
     try:
         values = code_runner_runtimes()
     except (requests.RequestException, ValueError):
@@ -4653,8 +4691,6 @@ def developer_runtimes():
 def developer_execute():
     if request.method == "OPTIONS":
         return "", 204
-    if not CODE_RUNNER_URL:
-        return api_error(503, "runner_not_configured", "The isolated code runner has not been connected yet.")
     if runner_rate_limited(g.user_id):
         return api_error(429, "runner_rate_limited", "Wait a moment before running more code.")
     payload = request.get_json(silent=True) or {}
@@ -4684,27 +4720,75 @@ def developer_execute():
         return api_error(422, "runner_entrypoint_missing", "The selected entry file is missing.")
     files = sorted(files, key=lambda item: item["name"] != entrypoint)
     try:
-        runtimes = code_runner_runtimes()
+        try:
+            runtimes = code_runner_runtimes()
+        except requests.RequestException:
+            if _runner_runtime_cache["values"]:
+                runtimes = _runner_runtime_cache["values"]
+                app.logger.warning("Using last known runner runtimes after an availability check failed")
+            else:
+                raise
         runtime = next((item for item in runtimes if language in {str(item.get("language") or ""), *[str(alias) for alias in item.get("aliases", [])]}), None)
         if not runtime:
             return api_error(422, "runtime_not_installed", f"The {requested_language or language} runtime is not installed on the runner.")
-        response = requests.post(
-            f"{CODE_RUNNER_URL}/execute",
-            headers=code_runner_headers(),
-            json={
-                "language": runtime.get("language"),
-                "version": runtime.get("version"),
-                "files": files,
-                "stdin": str(payload.get("stdin") or "")[:10000],
-                "run_timeout": 5000,
-                "run_cpu_time": 5000,
-                "compile_timeout": 10000,
-                "compile_cpu_time": 10000,
-            },
-            timeout=CODE_RUNNER_TIMEOUT_SECONDS,
-        )
+        if CODE_RUNNER_URL:
+            response = requests.post(
+                f"{CODE_RUNNER_URL}/execute",
+                headers=code_runner_headers(),
+                json={
+                    "language": runtime.get("language"),
+                    "version": runtime.get("version"),
+                    "files": files,
+                    "stdin": str(payload.get("stdin") or "")[:10000],
+                    "run_timeout": 5000,
+                    "run_cpu_time": 5000,
+                    "compile_timeout": 10000,
+                    "compile_cpu_time": 10000,
+                },
+                timeout=CODE_RUNNER_TIMEOUT_SECONDS,
+            )
+        else:
+            entry = next(item for item in files if item["name"] == entrypoint)
+            response = requests.post(
+                f"{WANDBOX_API_URL}/compile.json",
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json={
+                    "compiler": runtime.get("compiler"),
+                    "code": entry["content"],
+                    "codes": [
+                        {"file": item["name"], "code": item["content"]}
+                        for item in files if item["name"] != entrypoint
+                    ],
+                    "stdin": str(payload.get("stdin") or "")[:10000],
+                },
+                timeout=CODE_RUNNER_TIMEOUT_SECONDS,
+            )
         response.raise_for_status()
         result = response.json()
+        if not CODE_RUNNER_URL:
+            compiler_output = "".join([
+                str(result.get("compiler_output") or ""),
+                str(result.get("compiler_error") or ""),
+            ])
+            program_output = "".join([
+                str(result.get("program_output") or ""),
+                str(result.get("program_error") or ""),
+            ])
+            result = {
+                "compile": {
+                    "output": compiler_output,
+                    "stdout": str(result.get("compiler_output") or ""),
+                    "stderr": str(result.get("compiler_error") or ""),
+                    "code": 0 if not compiler_output else int(result.get("status") or 1),
+                },
+                "run": {
+                    "output": program_output,
+                    "stdout": str(result.get("program_output") or ""),
+                    "stderr": str(result.get("program_error") or ""),
+                    "code": int(result.get("status") or 0),
+                    "signal": str(result.get("signal") or "") or None,
+                },
+            }
     except requests.Timeout:
         return api_error(504, "runner_timeout", "The isolated code run timed out.")
     except (requests.RequestException, ValueError):
