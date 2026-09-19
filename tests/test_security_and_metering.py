@@ -765,6 +765,15 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertTrue(wsgi.is_team({"email": approved}))
         self.assertFalse(wsgi.is_team({"email": "public@example.com"}))
 
+    def test_developer_account_has_team_tools_without_admin_access(self):
+        user = {"email": "noahsteiner@icloud.com"}
+        with patch.object(wsgi, "DEVELOPER_EMAILS", {"noahsteiner@icloud.com"}), patch.object(
+            wsgi, "TEAM_EMAILS", {"noahsteiner@icloud.com"}
+        ), patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}):
+            self.assertTrue(wsgi.is_developer(user))
+            self.assertTrue(wsgi.is_team(user))
+            self.assertFalse(wsgi.is_admin(user))
+
     def test_invite_manager_permission_is_separate_from_ceo_admin(self):
         with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(
             wsgi, "INVITE_MANAGER_EMAILS", {"manager@example.com"}

@@ -126,7 +126,14 @@ MAINTENANCE_BYPASS_EMAILS = {
     ).split(",")
     if value.strip()
 }
-TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS
+DEVELOPER_EMAILS = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "DEVELOPER_EMAILS", "noahsteiner@icloud.com"
+    ).split(",")
+    if value.strip()
+}
+TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS | DEVELOPER_EMAILS
 INVITE_MANAGER_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
@@ -1678,6 +1685,10 @@ def user_email(user):
 
 def is_admin(user):
     return user_email(user) in ADMIN_EMAILS
+
+
+def is_developer(user):
+    return user_email(user) in DEVELOPER_EMAILS
 
 
 def can_manage_invites(user):
@@ -3512,6 +3523,7 @@ def team_mode():
         {
             "eligible": eligible,
             "admin": is_admin(g.user),
+            "developer": is_developer(g.user),
             "can_manage_invites": can_manage_invites(g.user),
             "limited_mode": limited,
             "unlimited": eligible and not limited,
