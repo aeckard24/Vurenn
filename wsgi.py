@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
-from urllib.parse import quote, quote_plus, unquote, urlparse
+from urllib.parse import quote, quote_plus, unquote, urljoin, urlparse
 
 import requests
 import stripe
@@ -82,6 +82,16 @@ CHAT_IO_POOL = ThreadPoolExecutor(
     max_workers=max(4, int(os.environ.get("CHAT_IO_WORKERS", "8"))),
     thread_name_prefix="vurenn-chat-io",
 )
+SECURITY_SCAN_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vurenn-security-scan")
+SECURITY_SCAN_REPOSITORIES = os.environ.get(
+    "SECURITY_SCAN_REPOSITORIES",
+    "frontend|https://github.com/Steineydog2445/vurenn/archive/refs/heads/main.zip,"
+    "backend|https://github.com/aeckard24/Vurenn/archive/refs/heads/updated-api-key.zip",
+)
+GITHUB_SCAN_TOKEN = os.environ.get("GITHUB_SCAN_TOKEN", "")
+OSV_API_URL = os.environ.get("OSV_API_URL", "https://api.osv.dev/v1").rstrip("/")
+_security_scan_lock = threading.Lock()
+_security_scan_jobs = {}
 LEGAL_POLICY_VERSION = os.environ.get("LEGAL_POLICY_VERSION", "2026-08-08")
 GENERATED_IMAGE_BUCKET = os.environ.get(
     "GENERATED_IMAGE_BUCKET", "vurenn-generated-images"
@@ -1076,6 +1086,228 @@ def save_app_setting(key, value, user_id):
         },
         prefer="resolution=merge-duplicates,return=minimal",
     )
+
+
+SCAN_TEXT_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".html", ".css", ".sql",
+    ".yml", ".yaml", ".toml", ".md", ".txt", ".sh", ".ps1", ".java", ".go",
+    ".rs", ".php", ".rb", ".cs", ".cpp", ".c", ".swift", ".kt", ".dart",
+}
+SCAN_IGNORED_PARTS = {"node_modules", ".git", ".next", "dist", "build", "coverage", "vendor", "__pycache__"}
+SCAN_SECRET_RULES = (
+    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "Critical", "Private key material appears in source control."),
+    ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}\b"), "Critical", "An OpenAI-style secret key appears in source control."),
+    ("github_token", re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"), "Critical", "A GitHub access token appears in source control."),
+    ("generic_secret", re.compile(r"(?i)\b(?:api[_-]?key|secret|password|token)\b\s*[:=]\s*['\"][^'\"\n]{16,}['\"]"), "High", "A hard-coded credential-like value appears in source."),
+)
+SCAN_CODE_RULES = (
+    ("python_eval", {".py"}, re.compile(r"\b(?:eval|exec)\s*\("), "High", "Dynamic code execution can turn untrusted input into server-side code execution.", "Remove dynamic execution or strictly constrain inputs."),
+    ("shell_true", {".py"}, re.compile(r"subprocess\.(?:run|Popen|call)\([^\n]*shell\s*=\s*True"), "High", "Shell execution may allow command injection.", "Pass an argument array and keep shell=False."),
+    ("unsafe_html", {".js", ".jsx", ".ts", ".tsx"}, re.compile(r"dangerouslySetInnerHTML|\.innerHTML\s*="), "Medium", "Direct HTML injection can introduce cross-site scripting.", "Render text safely or sanitize trusted markup."),
+    ("weak_random", {".js", ".jsx", ".ts", ".tsx"}, re.compile(r"Math\.random\(\)"), "Low", "Math.random is not suitable for security-sensitive identifiers.", "Use crypto.getRandomValues or a server-generated identifier."),
+    ("permissive_cors", {".py", ".js", ".ts"}, re.compile(r"(?i)(?:allow_origins|access-control-allow-origin)[^\n]{0,40}(?:\*|all)"), "Medium", "A permissive cross-origin policy may expose authenticated endpoints.", "Allow only the production origins that require access."),
+    ("sql_interpolation", {".py", ".js", ".ts"}, re.compile(r"(?i)(?:select|insert|update|delete)[^\n]{0,80}(?:\$\{|%s|\.format\()"), "High", "An interpolated SQL statement may permit injection.", "Use bound parameters instead of string interpolation."),
+)
+
+
+def security_scan_update(job_id, **changes):
+    with _security_scan_lock:
+        job = _security_scan_jobs.get(job_id)
+        if not job:
+            return
+        job.update(changes)
+        job["updated_at"] = utc_now()
+
+
+def security_scan_sources():
+    sources = []
+    source_errors = []
+    local_files = {}
+    root = Path(__file__).resolve().parent
+    for path in root.rglob("*"):
+        if not path.is_file() or set(path.parts) & SCAN_IGNORED_PARTS:
+            continue
+        if path.suffix.lower() not in SCAN_TEXT_SUFFIXES or path.stat().st_size > 750_000:
+            continue
+        local_files[str(path.relative_to(root)).replace("\\", "/")] = path.read_text("utf-8", errors="replace")
+    sources.append({"repository": "backend-deployment", "files": local_files})
+    headers = {"Accept": "application/zip", "User-Agent": "Vurenn-Security-Scanner/1.0"}
+    if GITHUB_SCAN_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_SCAN_TOKEN}"
+    for raw in SECURITY_SCAN_REPOSITORIES.split(","):
+        label, separator, url = raw.strip().partition("|")
+        if not separator or not url.startswith("https://github.com/"):
+            continue
+        try:
+            response = requests.get(url, headers=headers, timeout=(10, 90))
+            response.raise_for_status()
+            if len(response.content) > 35_000_000:
+                raise ValueError(f"{label} archive is larger than the 35 MB scan limit")
+            files = {}
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                for member in archive.infolist():
+                    path = member.filename.split("/", 1)[-1]
+                    parts = set(Path(path).parts)
+                    suffix = Path(path).suffix.lower()
+                    if member.is_dir() or parts & SCAN_IGNORED_PARTS or suffix not in SCAN_TEXT_SUFFIXES:
+                        continue
+                    if member.file_size > 750_000 or len(files) >= 2500:
+                        continue
+                    files[path] = archive.read(member).decode("utf-8", errors="replace")
+            sources.append({"repository": label[:40], "files": files})
+        except (requests.RequestException, ValueError, zipfile.BadZipFile) as error:
+            source_errors.append({"repository": label[:40], "message": str(error)[:180]})
+    if any(item["repository"] == "frontend" for item in source_errors):
+        try:
+            page = requests.get(FRONTEND_URL, headers={"User-Agent": "Vurenn-Security-Scanner/1.0"}, timeout=(10, 30))
+            page.raise_for_status()
+            assets = {}
+            script_urls = list(dict.fromkeys(re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)', page.text, flags=re.IGNORECASE)))[:60]
+            for script_url in script_urls:
+                absolute = urljoin(f"{FRONTEND_URL}/", script_url)
+                asset = requests.get(absolute, headers={"User-Agent": "Vurenn-Security-Scanner/1.0"}, timeout=(10, 30))
+                if asset.ok and len(asset.content) <= 2_000_000:
+                    assets[urlparse(absolute).path.lstrip("/")] = asset.text
+            if assets:
+                sources.append({"repository": "frontend-deployment", "files": assets, "compiled": True})
+        except requests.RequestException as error:
+            source_errors.append({"repository": "frontend-deployment", "message": str(error)[:180]})
+    return sources, source_errors
+
+
+def add_scan_finding(findings, *, rule_id, severity, title, repository, path, line, description, recommendation):
+    if len(findings) >= 200:
+        return
+    key = (rule_id, repository, path, line)
+    if any(item.get("key") == key for item in findings):
+        return
+    findings.append({
+        "key": key, "rule_id": rule_id, "severity": severity, "title": title,
+        "repository": repository, "path": path, "line": line,
+        "description": description, "recommendation": recommendation,
+    })
+
+
+def scan_source_rules(sources, findings):
+    for source in sources:
+        repository = source["repository"]
+        for path, content in source["files"].items():
+            suffix = Path(path).suffix.lower()
+            if path.endswith(".env.example") or "/tests/" in f"/{path.lower()}/":
+                secret_rules = ()
+            else:
+                secret_rules = SCAN_SECRET_RULES
+            for rule_id, pattern, severity, description in secret_rules:
+                match = pattern.search(content)
+                if match:
+                    add_scan_finding(
+                        findings, rule_id=rule_id, severity=severity,
+                        title="Potential credential exposure", repository=repository, path=path,
+                        line=content.count("\n", 0, match.start()) + 1, description=description,
+                        recommendation="Revoke the credential, remove it from history, and load replacements from protected environment variables.",
+                    )
+            for rule_id, suffixes, pattern, severity, description, recommendation in (() if source.get("compiled") else SCAN_CODE_RULES):
+                if suffix not in suffixes:
+                    continue
+                for match in list(pattern.finditer(content))[:8]:
+                    add_scan_finding(
+                        findings, rule_id=rule_id, severity=severity,
+                        title=rule_id.replace("_", " ").title(), repository=repository, path=path,
+                        line=content.count("\n", 0, match.start()) + 1,
+                        description=description, recommendation=recommendation,
+                    )
+
+
+def scan_dependency_inventory(sources):
+    packages = []
+    for source in sources:
+        repository = source["repository"]
+        for path, content in source["files"].items():
+            if path.endswith("requirements.txt"):
+                for line in content.splitlines():
+                    match = re.match(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+-]+)$", line.strip())
+                    if match:
+                        packages.append({"repository": repository, "path": path, "name": match.group(1), "version": match.group(2), "ecosystem": "PyPI"})
+            elif path.endswith("package.json"):
+                try:
+                    package_json = json.loads(content)
+                except (TypeError, ValueError):
+                    continue
+                dependencies = {**(package_json.get("dependencies") or {}), **(package_json.get("devDependencies") or {})}
+                for name, raw_version in dependencies.items():
+                    match = re.search(r"\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]+)?", str(raw_version))
+                    if match:
+                        packages.append({"repository": repository, "path": path, "name": str(name), "version": match.group(0), "ecosystem": "npm"})
+    unique = {}
+    for package in packages:
+        unique[(package["ecosystem"], package["name"], package["version"])] = package
+    return list(unique.values())[:300]
+
+
+def scan_dependencies(packages, findings):
+    for offset in range(0, len(packages), 100):
+        batch = packages[offset:offset + 100]
+        response = requests.post(
+            f"{OSV_API_URL}/querybatch",
+            json={"queries": [{"version": item["version"], "package": {"name": item["name"], "ecosystem": item["ecosystem"]}} for item in batch]},
+            timeout=(10, 60),
+        )
+        response.raise_for_status()
+        results = (response.json() or {}).get("results") or []
+        for package, result in zip(batch, results):
+            for vulnerability in (result or {}).get("vulns") or []:
+                vulnerability_id = str(vulnerability.get("id") or "OSV")
+                add_scan_finding(
+                    findings, rule_id=vulnerability_id, severity="High",
+                    title=f"Vulnerable dependency: {package['name']}", repository=package["repository"],
+                    path=package["path"], line=1,
+                    description=str(vulnerability.get("summary") or f"{package['name']} {package['version']} is affected by {vulnerability_id}."),
+                    recommendation=f"Review {vulnerability_id} and update {package['name']} from {package['version']} to a patched release.",
+                )
+
+
+def run_security_scan(job_id, requested_by, requested_by_email):
+    started = time.monotonic()
+    findings = []
+    try:
+        security_scan_update(job_id, status="running", stage="Fetching protected source snapshots", progress=8)
+        sources, source_errors = security_scan_sources()
+        file_count = sum(len(source["files"]) for source in sources)
+        security_scan_update(job_id, stage="Building code and dependency inventory", progress=24, files_scanned=file_count, repositories=[source["repository"] for source in sources])
+        packages = scan_dependency_inventory(sources)
+        security_scan_update(job_id, stage="Checking secrets and unsafe code paths", progress=42, dependencies_scanned=len(packages))
+        scan_source_rules(sources, findings)
+        for source_error in source_errors:
+            add_scan_finding(
+                findings, rule_id="source_snapshot_unavailable", severity="Low",
+                title="Full source snapshot unavailable", repository=source_error["repository"],
+                path="repository configuration", line=1,
+                description="The deployed scanner could not read this private repository snapshot. Deployed artifacts are still scanned where available.",
+                recommendation="Add a read-only GITHUB_SCAN_TOKEN to the backend environment for full private-source coverage.",
+            )
+        security_scan_update(job_id, stage="Checking dependencies against OSV", progress=68, findings=findings)
+        scan_dependencies(packages, findings)
+        security_scan_update(job_id, stage="Prioritizing and verifying findings", progress=88, findings=findings)
+        severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        findings.sort(key=lambda item: (severity_order.get(item["severity"], 9), item["repository"], item["path"], item["line"]))
+        counts = {severity: sum(item["severity"] == severity for item in findings) for severity in ("Critical", "High", "Medium", "Low")}
+        completed = {
+            "id": job_id, "status": "complete", "stage": "Scan complete", "progress": 100,
+            "started_at": _security_scan_jobs[job_id]["started_at"], "completed_at": utc_now(),
+            "duration_seconds": round(time.monotonic() - started, 1), "requested_by": requested_by_email,
+            "files_scanned": file_count, "dependencies_scanned": len(packages),
+            "repositories": [source["repository"] for source in sources], "counts": counts,
+            "findings": findings, "updated_at": utc_now(),
+        }
+        with _security_scan_lock:
+            _security_scan_jobs[job_id] = completed
+        try:
+            save_app_setting("latest_vulnerability_scan", completed, requested_by)
+        except Exception:
+            app.logger.exception("Could not persist completed vulnerability scan")
+    except Exception as error:
+        app.logger.exception("Vulnerability scan failed")
+        security_scan_update(job_id, status="failed", stage="Scan failed", progress=100, error=str(error)[:300])
 
 
 def journal_audit():
@@ -2882,6 +3114,17 @@ def team_required(handler):
     return wrapped
 
 
+def security_scanner_required(handler):
+    @wraps(handler)
+    @auth_required
+    def wrapped(*args, **kwargs):
+        if not (is_admin(g.user) or is_developer(g.user)):
+            return api_error(403, "security_scanner_required", "CEO or Developer Mode access required.")
+        return handler(*args, **kwargs)
+
+    return wrapped
+
+
 def invite_manager_required(handler):
     @wraps(handler)
     @auth_required
@@ -3531,6 +3774,38 @@ def team_mode():
             "effective_plan": user_plan(g.user, g.user_id),
         }
     )
+
+
+@app.route("/v1/security-scans", methods=["GET", "POST", "OPTIONS"])
+@security_scanner_required
+def security_scans():
+    if request.method == "GET":
+        with _security_scan_lock:
+            active = next((dict(job) for job in _security_scan_jobs.values() if job.get("status") in {"queued", "running"}), None)
+            memory_latest = next((dict(job) for job in reversed(list(_security_scan_jobs.values())) if job.get("status") == "complete"), None)
+        latest = memory_latest or app_setting_value("latest_vulnerability_scan", None)
+        return jsonify({"active": active, "latest": latest, "access": "ceo_or_developer"})
+    with _security_scan_lock:
+        active = next((job for job in _security_scan_jobs.values() if job.get("status") in {"queued", "running"}), None)
+        if active:
+            return jsonify(active), 202
+        job_id = str(uuid.uuid4())
+        job = {
+            "id": job_id, "status": "queued", "stage": "Preparing scan", "progress": 2,
+            "started_at": utc_now(), "updated_at": utc_now(), "requested_by": user_email(g.user),
+            "files_scanned": 0, "dependencies_scanned": 0, "repositories": [], "findings": [],
+        }
+        _security_scan_jobs[job_id] = job
+    SECURITY_SCAN_POOL.submit(run_security_scan, job_id, g.user_id, user_email(g.user))
+    return jsonify(job), 202
+
+
+@app.route("/v1/security-scans/<job_id>", methods=["GET", "OPTIONS"])
+@security_scanner_required
+def security_scan_item(job_id):
+    with _security_scan_lock:
+        job = _security_scan_jobs.get(job_id)
+        return jsonify(job) if job else api_error(404, "scan_not_found", "That vulnerability scan is no longer available.")
 
 
 @app.route("/v1/admin/dashboard", methods=["GET", "OPTIONS"])

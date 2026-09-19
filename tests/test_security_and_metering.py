@@ -1,6 +1,7 @@
 import unittest
 import base64
 import io
+import json
 import threading
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch
@@ -773,6 +774,35 @@ class SecurityAndMeteringTests(unittest.TestCase):
             self.assertTrue(wsgi.is_developer(user))
             self.assertTrue(wsgi.is_team(user))
             self.assertFalse(wsgi.is_admin(user))
+
+    def test_security_scanner_is_restricted_to_ceo_and_developer_accounts(self):
+        public = {"id": "public-1", "email": "public@example.com"}
+        with patch.object(wsgi, "authenticate", return_value=public), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ):
+            response = wsgi.app.test_client().get(
+                "/v1/security-scans", headers={"Authorization": "Bearer test-token"}
+            )
+        self.assertEqual(response.status_code, 403)
+
+        developer = {"id": "dev-1", "email": "noahsteiner@icloud.com"}
+        with patch.object(wsgi, "authenticate", return_value=developer), patch.object(
+            wsgi, "construction_mode_enabled", return_value=False
+        ), patch.object(wsgi, "DEVELOPER_EMAILS", {"noahsteiner@icloud.com"}), patch.object(
+            wsgi, "app_setting_value", return_value=None
+        ):
+            response = wsgi.app.test_client().get(
+                "/v1/security-scans", headers={"Authorization": "Bearer test-token"}
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_security_scanner_reports_location_without_returning_secret_value(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        sources = [{"repository": "frontend", "files": {"src/config.ts": f'const key = "{secret}"'}}]
+        findings = []
+        wsgi.scan_source_rules(sources, findings)
+        self.assertTrue(any(item["rule_id"] == "openai_key" for item in findings))
+        self.assertNotIn(secret, json.dumps(findings))
 
     def test_invite_manager_permission_is_separate_from_ceo_admin(self):
         with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(
