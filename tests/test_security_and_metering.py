@@ -1140,10 +1140,11 @@ class SecurityAndMeteringTests(unittest.TestCase):
         runtime_response = Mock()
         runtime_response.raise_for_status.return_value = None
         runtime_response.json.return_value = {
-            "status": "0", "program_output": "fallback works\n",
-            "program_error": "", "compiler_output": "", "compiler_error": "", "signal": "",
+            "status": {"id": 3, "description": "Accepted"},
+            "stdout": base64.b64encode(b"fallback works\n").decode("ascii"),
+            "stderr": None, "compile_output": None, "message": None,
         }
-        runtimes = [{"language": "python", "version": "3.13.8", "aliases": [], "compiler": "cpython-3.13.8"}]
+        runtimes = [{"language": "python", "version": "3.13.2", "aliases": [], "language_id": 109}]
         with wsgi.app.test_request_context(
             "/v1/developer/execute", method="POST",
             json={"language": "python", "entrypoint": "main.py", "files": [{"name": "main.py", "content": "print('fallback works')"}]},
@@ -1156,8 +1157,8 @@ class SecurityAndMeteringTests(unittest.TestCase):
             response = wsgi.developer_execute.__wrapped__()
 
         self.assertEqual(response.get_json()["run"]["output"], "fallback works\n")
-        self.assertEqual(runner.call_args.args[0], "https://wandbox.org/api/compile.json")
-        self.assertEqual(runner.call_args.kwargs["json"]["compiler"], "cpython-3.13.8")
+        self.assertEqual(runner.call_args.args[0], "https://ce.judge0.com/submissions?base64_encoded=true&wait=true")
+        self.assertEqual(runner.call_args.kwargs["json"]["language_id"], 109)
 
     def test_conversation_delete_is_scoped_to_its_owner(self):
         with wsgi.app.test_request_context(

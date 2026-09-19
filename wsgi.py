@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 import wave
+import zipfile
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -68,7 +69,7 @@ OPENAI_TRANSCRIBE_MODEL = os.environ.get(
 CODE_RUNNER_URL = os.environ.get("CODE_RUNNER_URL", "").rstrip("/")
 CODE_RUNNER_TOKEN = os.environ.get("CODE_RUNNER_TOKEN", "")
 CODE_RUNNER_TIMEOUT_SECONDS = int(os.environ.get("CODE_RUNNER_TIMEOUT_SECONDS", "20"))
-WANDBOX_API_URL = os.environ.get("WANDBOX_API_URL", "https://wandbox.org/api").rstrip("/")
+JUDGE0_API_URL = os.environ.get("JUDGE0_API_URL", "https://ce.judge0.com").rstrip("/")
 FACEBOOK_PAGE_URL = os.environ.get(
     "FACEBOOK_PAGE_URL",
     "https://www.facebook.com/people/Vurenn-AI/61592711165046/",
@@ -4628,7 +4629,7 @@ def code_runner_runtimes():
         )
     else:
         response = requests.get(
-            f"{WANDBOX_API_URL}/list.json",
+            f"{JUDGE0_API_URL}/languages",
             headers={"Accept": "application/json"},
             timeout=min(CODE_RUNNER_TIMEOUT_SECONDS, 15),
         )
@@ -4636,29 +4637,35 @@ def code_runner_runtimes():
     values = response.json()
     values = values if isinstance(values, list) else []
     if not CODE_RUNNER_URL:
-        normalized = []
-        seen = set()
-        language_names = {
-            "python": "python", "javascript": "javascript", "typescript": "typescript",
-            "c": "c", "c++": "c++", "java": "java", "go": "go", "rust": "rust",
-            "ruby": "ruby", "php": "php", "lua": "lua", "perl": "perl",
-            "haskell": "haskell", "julia": "julia", "swift": "swift",
-        }
+        newest = {}
         for value in values:
             if not isinstance(value, dict):
                 continue
-            language = language_names.get(str(value.get("language") or "").lower())
-            compiler = str(value.get("name") or "")
-            if not language or not compiler or language in seen:
+            name = str(value.get("name") or "")
+            language = next((key for prefix, key in (
+                ("C++", "c++"), ("C#", "csharp"), ("C (", "c"),
+                ("Python", "python"), ("JavaScript", "javascript"),
+                ("TypeScript", "typescript"), ("Java (", "java"),
+                ("Go (", "go"), ("Rust", "rust"), ("Ruby", "ruby"),
+                ("PHP", "php"), ("Lua", "lua"), ("Perl", "perl"),
+                ("Haskell", "haskell"), ("Swift", "swift"), ("Kotlin", "kotlin"),
+                ("Dart", "dart"), ("R (", "rscript"), ("Scala", "scala"),
+                ("Elixir", "elixir"), ("Erlang", "erlang"), ("F#", "fsharp.net"),
+                ("Groovy", "groovy"), ("SQL", "sqlite3"), ("Fortran", "fortran"),
+                ("COBOL", "cobol"), ("Bash", "bash"),
+            ) if name.startswith(prefix)), None)
+            language_id = value.get("id")
+            if not language or not isinstance(language_id, int):
                 continue
-            seen.add(language)
-            normalized.append({
+            if language in newest and newest[language]["language_id"] > language_id:
+                continue
+            newest[language] = {
                 "language": language,
-                "version": str(value.get("version") or "latest"),
+                "version": name[name.find("(") + 1:name.rfind(")")] if "(" in name else "latest",
                 "aliases": [],
-                "compiler": compiler,
-            })
-        values = normalized
+                "language_id": language_id,
+            }
+        values = list(newest.values())
     if values:
         _runner_runtime_cache["values"] = values
         _runner_runtime_cache["expires_at"] = now + 60
@@ -4761,44 +4768,56 @@ def developer_execute():
             )
         else:
             entry = next(item for item in files if item["name"] == entrypoint)
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                for item in files:
+                    if item["name"] != entrypoint:
+                        bundle.writestr(item["name"], item["content"])
+            judge_payload = {
+                "language_id": runtime.get("language_id"),
+                "source_code": base64.b64encode(entry["content"].encode("utf-8")).decode("ascii"),
+                "stdin": base64.b64encode(str(payload.get("stdin") or "")[:10000].encode("utf-8")).decode("ascii"),
+                "cpu_time_limit": 5,
+                "wall_time_limit": 10,
+                "memory_limit": 262144,
+            }
+            if len(files) > 1:
+                judge_payload["additional_files"] = base64.b64encode(archive.getvalue()).decode("ascii")
             response = requests.post(
-                f"{WANDBOX_API_URL}/compile.json",
+                f"{JUDGE0_API_URL}/submissions?base64_encoded=true&wait=true",
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
-                json={
-                    "compiler": runtime.get("compiler"),
-                    "code": entry["content"],
-                    "codes": [
-                        {"file": item["name"], "code": item["content"]}
-                        for item in files if item["name"] != entrypoint
-                    ],
-                    "stdin": str(payload.get("stdin") or "")[:10000],
-                },
+                json=judge_payload,
                 timeout=CODE_RUNNER_TIMEOUT_SECONDS,
             )
         response.raise_for_status()
         result = response.json()
         if not CODE_RUNNER_URL:
-            compiler_output = "".join([
-                str(result.get("compiler_output") or ""),
-                str(result.get("compiler_error") or ""),
-            ])
-            program_output = "".join([
-                str(result.get("program_output") or ""),
-                str(result.get("program_error") or ""),
-            ])
+            def decode_judge_field(field):
+                value = result.get(field)
+                if not value:
+                    return ""
+                try:
+                    return base64.b64decode(str(value)).decode("utf-8", errors="replace")
+                except (ValueError, TypeError):
+                    return str(value)
+
+            compiler_output = decode_judge_field("compile_output")
+            stdout = decode_judge_field("stdout")
+            stderr = decode_judge_field("stderr") or decode_judge_field("message")
+            status_id = (result.get("status") or {}).get("id")
             result = {
                 "compile": {
                     "output": compiler_output,
-                    "stdout": str(result.get("compiler_output") or ""),
-                    "stderr": str(result.get("compiler_error") or ""),
-                    "code": 0 if not compiler_output else int(result.get("status") or 1),
+                    "stdout": "",
+                    "stderr": compiler_output,
+                    "code": 0 if not compiler_output else 1,
                 },
                 "run": {
-                    "output": program_output,
-                    "stdout": str(result.get("program_output") or ""),
-                    "stderr": str(result.get("program_error") or ""),
-                    "code": int(result.get("status") or 0),
-                    "signal": str(result.get("signal") or "") or None,
+                    "output": stdout + stderr,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "code": 0 if status_id == 3 else 1,
+                    "signal": None,
                 },
             }
     except requests.Timeout:
