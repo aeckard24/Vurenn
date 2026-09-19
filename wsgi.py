@@ -1093,7 +1093,11 @@ SCAN_TEXT_SUFFIXES = {
     ".yml", ".yaml", ".toml", ".md", ".txt", ".sh", ".ps1", ".java", ".go",
     ".rs", ".php", ".rb", ".cs", ".cpp", ".c", ".swift", ".kt", ".dart",
 }
-SCAN_IGNORED_PARTS = {"node_modules", ".git", ".next", "dist", "build", "coverage", "vendor", "__pycache__"}
+SCAN_IGNORED_PARTS = {
+    "node_modules", ".git", ".next", "dist", "build", "coverage", "vendor",
+    "__pycache__", ".venv", "venv", "env", "site-packages", ".pnpm", ".cache",
+    ".pytest_cache", ".mypy_cache", ".tox", ".turbo",
+}
 SCAN_SECRET_RULES = (
     ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "Critical", "Private key material appears in source control."),
     ("openai_key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}\b"), "Critical", "An OpenAI-style secret key appears in source control."),
@@ -1176,7 +1180,7 @@ def security_scan_sources(github_token=None):
     return sources, source_errors
 
 
-def add_scan_finding(findings, *, rule_id, severity, title, repository, path, line, description, recommendation, details=None):
+def add_scan_finding(findings, *, rule_id, severity, title, repository, path, line, description, recommendation, details=None, classification="review_candidate"):
     if len(findings) >= 200:
         return
     key = (rule_id, repository, path, line)
@@ -1186,7 +1190,7 @@ def add_scan_finding(findings, *, rule_id, severity, title, repository, path, li
         "key": key, "rule_id": rule_id, "severity": severity, "title": title,
         "repository": repository, "path": path, "line": line,
         "description": description, "recommendation": recommendation,
-        "details": details or {},
+        "classification": classification, "details": details or {},
     })
 
 
@@ -1198,7 +1202,7 @@ def scan_source_rules(sources, findings):
             if path.endswith(".env.example") or "/tests/" in f"/{path.lower()}/":
                 secret_rules = ()
             else:
-                secret_rules = SCAN_SECRET_RULES
+                secret_rules = SCAN_SECRET_RULES[:3] if source.get("compiled") else SCAN_SECRET_RULES
             for rule_id, pattern, severity, description in secret_rules:
                 match = pattern.search(content)
                 if match:
@@ -1207,7 +1211,39 @@ def scan_source_rules(sources, findings):
                         title="Potential credential exposure", repository=repository, path=path,
                         line=content.count("\n", 0, match.start()) + 1, description=description,
                         recommendation="Revoke the credential, remove it from history, and load replacements from protected environment variables.",
+                        classification="verified" if rule_id in {"private_key", "openai_key", "github_token"} else "review_candidate",
                     )
+            if suffix == ".py" and not source.get("compiled"):
+                try:
+                    tree = ast.parse(content, filename=path)
+                except SyntaxError:
+                    tree = None
+                for node in ast.walk(tree) if tree else ():
+                    if not isinstance(node, ast.Call):
+                        continue
+                    if isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec"}:
+                        add_scan_finding(
+                            findings, rule_id="python_eval", severity="High",
+                            title="Python Eval", repository=repository, path=path,
+                            line=getattr(node, "lineno", 1),
+                            description="Dynamic code execution can turn untrusted input into server-side code execution.",
+                            recommendation="Remove dynamic execution or strictly constrain inputs.",
+                        )
+                    if (
+                        isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr in {"run", "Popen", "call"}
+                        and any(keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in node.keywords)
+                    ):
+                        add_scan_finding(
+                            findings, rule_id="shell_true", severity="High",
+                            title="Shell True", repository=repository, path=path,
+                            line=getattr(node, "lineno", 1),
+                            description="Shell execution may allow command injection.",
+                            recommendation="Pass an argument array and keep shell=False.",
+                        )
+                continue
             for rule_id, suffixes, pattern, severity, description, recommendation in (() if source.get("compiled") else SCAN_CODE_RULES):
                 if suffix not in suffixes:
                     continue
@@ -1247,6 +1283,8 @@ def scan_dependency_inventory(sources):
 
 
 def scan_dependencies(packages, findings):
+    seen_advisories = set()
+    advisory_cache = {}
     for offset in range(0, len(packages), 100):
         batch = packages[offset:offset + 100]
         response = requests.post(
@@ -1259,6 +1297,20 @@ def scan_dependencies(packages, findings):
         for package, result in zip(batch, results):
             for vulnerability in (result or {}).get("vulns") or []:
                 vulnerability_id = str(vulnerability.get("id") or "OSV")
+                if vulnerability_id not in advisory_cache:
+                    try:
+                        detail_response = requests.get(f"{OSV_API_URL}/vulns/{quote(vulnerability_id, safe='')}", timeout=(10, 30))
+                        detail_response.raise_for_status()
+                        advisory_cache[vulnerability_id] = detail_response.json() or vulnerability
+                    except (requests.RequestException, ValueError):
+                        advisory_cache[vulnerability_id] = vulnerability
+                vulnerability = advisory_cache[vulnerability_id]
+                if vulnerability.get("withdrawn"):
+                    continue
+                advisory_names = {vulnerability_id, *(str(value) for value in (vulnerability.get("aliases") or []))}
+                if advisory_names & seen_advisories:
+                    continue
+                seen_advisories.update(advisory_names)
                 database_severity = str((vulnerability.get("database_specific") or {}).get("severity") or "").upper()
                 severity = {
                     "CRITICAL": "Critical", "HIGH": "High", "MODERATE": "Medium",
@@ -1292,6 +1344,7 @@ def scan_dependencies(packages, findings):
                         "fixed_versions": fixed_versions, "references": references,
                         "severity_basis": database_severity or "OSV advisory; manual severity review required",
                     },
+                    classification="verified",
                 )
 
 
@@ -1313,19 +1366,24 @@ def run_security_scan(job_id, requested_by, requested_by_email, github_token=Non
                 path="repository configuration", line=1,
                 description="The deployed scanner could not read this private repository snapshot. Deployed artifacts are still scanned where available.",
                 recommendation="Add a read-only GITHUB_SCAN_TOKEN to the backend environment for full private-source coverage.",
+                classification="coverage_gap",
             )
         security_scan_update(job_id, stage="Checking dependencies against OSV", progress=68, findings=findings)
         scan_dependencies(packages, findings)
         security_scan_update(job_id, stage="Prioritizing and verifying findings", progress=88, findings=findings)
         severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
         findings.sort(key=lambda item: (severity_order.get(item["severity"], 9), item["repository"], item["path"], item["line"]))
-        counts = {severity: sum(item["severity"] == severity for item in findings) for severity in ("Critical", "High", "Medium", "Low")}
+        verified_findings = [item for item in findings if item.get("classification") == "verified"]
+        counts = {severity: sum(item["severity"] == severity for item in verified_findings) for severity in ("Critical", "High", "Medium", "Low")}
         completed = {
             "id": job_id, "status": "complete", "stage": "Scan complete", "progress": 100,
             "started_at": _security_scan_jobs[job_id]["started_at"], "completed_at": utc_now(),
             "duration_seconds": round(time.monotonic() - started, 1), "requested_by": requested_by_email,
             "files_scanned": file_count, "dependencies_scanned": len(packages),
             "repositories": [source["repository"] for source in sources], "counts": counts,
+            "verified_count": len(verified_findings),
+            "review_candidate_count": sum(item.get("classification") == "review_candidate" for item in findings),
+            "coverage_gap_count": sum(item.get("classification") == "coverage_gap" for item in findings),
             "findings": findings, "updated_at": utc_now(),
         }
         with _security_scan_lock:

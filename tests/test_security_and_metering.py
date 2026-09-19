@@ -804,6 +804,22 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertTrue(any(item["rule_id"] == "openai_key" for item in findings))
         self.assertNotIn(secret, json.dumps(findings))
 
+    def test_security_scanner_does_not_flag_rule_text_as_executable_python(self):
+        sources = [{"repository": "backend", "files": {
+            "scanner.py": 'PATTERN = r"eval\\\\s*\\\\("\nvalue = ast.parse("1 + 2", mode="eval")\n'
+        }}]
+        findings = []
+        wsgi.scan_source_rules(sources, findings)
+        self.assertFalse(any(item["rule_id"] == "python_eval" for item in findings))
+
+    def test_compiled_assets_skip_low_confidence_generic_secret_rule(self):
+        sources = [{"repository": "frontend-deployment", "compiled": True, "files": {
+            "chunk.js": 'const label = "token: this-is-interface-copy-not-a-secret";'
+        }}]
+        findings = []
+        wsgi.scan_source_rules(sources, findings)
+        self.assertEqual(findings, [])
+
     def test_dependency_findings_include_advisory_and_upgrade_details(self):
         osv_response = Mock()
         osv_response.raise_for_status.return_value = None
@@ -820,6 +836,7 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertEqual(findings[0]["severity"], "High")
         self.assertEqual(findings[0]["details"]["fixed_versions"], ["2.0.0"])
         self.assertEqual(findings[0]["details"]["references"], ["https://example.com/advisory"])
+        self.assertEqual(findings[0]["classification"], "verified")
 
     def test_invite_manager_permission_is_separate_from_ceo_admin(self):
         with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(

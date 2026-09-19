@@ -19,6 +19,9 @@ Then open:
 import time
 import re
 import os
+import ast
+import math
+import operator
 import uuid
 import hashlib
 import asyncio
@@ -434,6 +437,34 @@ def is_math_problem(command: str):
         return cleaned.strip()
     return None
 
+def safe_numeric_expression(expression: str):
+    if len(expression) > 200:
+        raise ValueError("Expression is too long")
+    binary_operators = {
+        ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+        ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod, ast.Pow: operator.pow,
+    }
+    unary_operators = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+    def evaluate(node):
+        if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in binary_operators:
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                raise ValueError("Exponent is too large")
+            return binary_operators[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary_operators:
+            return unary_operators[type(node.op)](evaluate(node.operand))
+        raise ValueError("Expression contains unsupported syntax")
+
+    result = evaluate(ast.parse(expression, mode="eval").body)
+    if not isinstance(result, (int, float)) or not math.isfinite(result):
+        raise ValueError("Expression did not produce a finite number")
+    return result
+
+
 def solve_math_problem(command: str) -> str:
     try:
         expr = clean_math_query(command)
@@ -442,7 +473,7 @@ def solve_math_problem(command: str) -> str:
         if SYMPY_AVAILABLE:
             result = sp.sympify(expr).evalf()
             return str(int(result)) if result.is_integer else f"{float(result):.6f}".rstrip("0").rstrip(".")
-        return str(eval(expr))
+        return str(safe_numeric_expression(expr))
     except Exception as e:
         return f"I couldn't solve that. Error: {e}"
 
