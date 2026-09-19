@@ -767,9 +767,9 @@ class SecurityAndMeteringTests(unittest.TestCase):
         self.assertFalse(wsgi.is_team({"email": "public@example.com"}))
 
     def test_developer_account_has_team_tools_without_admin_access(self):
-        user = {"email": "noahsteiner@icloud.com"}
-        with patch.object(wsgi, "DEVELOPER_EMAILS", {"noahsteiner@icloud.com"}), patch.object(
-            wsgi, "TEAM_EMAILS", {"noahsteiner@icloud.com"}
+        user = {"email": "noahssteiner@icloud.com"}
+        with patch.object(wsgi, "DEVELOPER_EMAILS", {"noahssteiner@icloud.com"}), patch.object(
+            wsgi, "TEAM_EMAILS", {"noahssteiner@icloud.com"}
         ), patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}):
             self.assertTrue(wsgi.is_developer(user))
             self.assertTrue(wsgi.is_team(user))
@@ -803,6 +803,23 @@ class SecurityAndMeteringTests(unittest.TestCase):
         wsgi.scan_source_rules(sources, findings)
         self.assertTrue(any(item["rule_id"] == "openai_key" for item in findings))
         self.assertNotIn(secret, json.dumps(findings))
+
+    def test_dependency_findings_include_advisory_and_upgrade_details(self):
+        osv_response = Mock()
+        osv_response.raise_for_status.return_value = None
+        osv_response.json.return_value = {"results": [{"vulns": [{
+            "id": "GHSA-test", "summary": "Example advisory", "aliases": ["CVE-2026-0001"],
+            "database_specific": {"severity": "HIGH"},
+            "references": [{"url": "https://example.com/advisory"}],
+            "affected": [{"ranges": [{"events": [{"introduced": "0"}, {"fixed": "2.0.0"}]}]}],
+        }]}]}
+        packages = [{"repository": "frontend", "path": "package.json", "name": "example", "version": "1.0.0", "ecosystem": "npm"}]
+        findings = []
+        with patch.object(wsgi.requests, "post", return_value=osv_response):
+            wsgi.scan_dependencies(packages, findings)
+        self.assertEqual(findings[0]["severity"], "High")
+        self.assertEqual(findings[0]["details"]["fixed_versions"], ["2.0.0"])
+        self.assertEqual(findings[0]["details"]["references"], ["https://example.com/advisory"])
 
     def test_invite_manager_permission_is_separate_from_ceo_admin(self):
         with patch.object(wsgi, "ADMIN_EMAILS", {"ceo@example.com"}), patch.object(

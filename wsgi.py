@@ -140,10 +140,10 @@ MAINTENANCE_BYPASS_EMAILS = {
 DEVELOPER_EMAILS = {
     value.strip().lower()
     for value in os.environ.get(
-        "DEVELOPER_EMAILS", "noahsteiner@icloud.com"
+        "DEVELOPER_EMAILS", "noahssteiner@icloud.com,noahsteiner@icloud.com"
     ).split(",")
     if value.strip()
-}
+} | {"noahssteiner@icloud.com"}
 TEAM_EMAILS = ADMIN_EMAILS | MAINTENANCE_BYPASS_EMAILS | DEVELOPER_EMAILS
 INVITE_MANAGER_EMAILS = {
     value.strip().lower()
@@ -1119,7 +1119,7 @@ def security_scan_update(job_id, **changes):
         job["updated_at"] = utc_now()
 
 
-def security_scan_sources():
+def security_scan_sources(github_token=None):
     sources = []
     source_errors = []
     local_files = {}
@@ -1132,8 +1132,9 @@ def security_scan_sources():
         local_files[str(path.relative_to(root)).replace("\\", "/")] = path.read_text("utf-8", errors="replace")
     sources.append({"repository": "backend-deployment", "files": local_files})
     headers = {"Accept": "application/zip", "User-Agent": "Vurenn-Security-Scanner/1.0"}
-    if GITHUB_SCAN_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_SCAN_TOKEN}"
+    token = str(github_token or GITHUB_SCAN_TOKEN or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     for raw in SECURITY_SCAN_REPOSITORIES.split(","):
         label, separator, url = raw.strip().partition("|")
         if not separator or not url.startswith("https://github.com/"):
@@ -1175,7 +1176,7 @@ def security_scan_sources():
     return sources, source_errors
 
 
-def add_scan_finding(findings, *, rule_id, severity, title, repository, path, line, description, recommendation):
+def add_scan_finding(findings, *, rule_id, severity, title, repository, path, line, description, recommendation, details=None):
     if len(findings) >= 200:
         return
     key = (rule_id, repository, path, line)
@@ -1185,6 +1186,7 @@ def add_scan_finding(findings, *, rule_id, severity, title, repository, path, li
         "key": key, "rule_id": rule_id, "severity": severity, "title": title,
         "repository": repository, "path": path, "line": line,
         "description": description, "recommendation": recommendation,
+        "details": details or {},
     })
 
 
@@ -1257,21 +1259,48 @@ def scan_dependencies(packages, findings):
         for package, result in zip(batch, results):
             for vulnerability in (result or {}).get("vulns") or []:
                 vulnerability_id = str(vulnerability.get("id") or "OSV")
+                database_severity = str((vulnerability.get("database_specific") or {}).get("severity") or "").upper()
+                severity = {
+                    "CRITICAL": "Critical", "HIGH": "High", "MODERATE": "Medium",
+                    "MEDIUM": "Medium", "LOW": "Low",
+                }.get(database_severity, "Medium")
+                aliases = [str(value) for value in (vulnerability.get("aliases") or [])[:8]]
+                references = [
+                    str(item.get("url")) for item in (vulnerability.get("references") or [])
+                    if isinstance(item, dict) and item.get("url")
+                ][:5]
+                fixed_versions = []
+                for affected in vulnerability.get("affected") or []:
+                    for version_range in affected.get("ranges") or []:
+                        for event in version_range.get("events") or []:
+                            if event.get("fixed"):
+                                fixed_versions.append(str(event["fixed"]))
+                fixed_versions = list(dict.fromkeys(fixed_versions))[:8]
                 add_scan_finding(
-                    findings, rule_id=vulnerability_id, severity="High",
+                    findings, rule_id=vulnerability_id, severity=severity,
                     title=f"Vulnerable dependency: {package['name']}", repository=package["repository"],
                     path=package["path"], line=1,
                     description=str(vulnerability.get("summary") or f"{package['name']} {package['version']} is affected by {vulnerability_id}."),
-                    recommendation=f"Review {vulnerability_id} and update {package['name']} from {package['version']} to a patched release.",
+                    recommendation=(
+                        f"Update {package['name']} from {package['version']} to {fixed_versions[0]} or newer, then rerun the test suite and Sentinel."
+                        if fixed_versions else
+                        f"Review {vulnerability_id}, identify the first patched {package['name']} release, update from {package['version']}, and rerun Sentinel."
+                    ),
+                    details={
+                        "package": package["name"], "installed_version": package["version"],
+                        "ecosystem": package["ecosystem"], "aliases": aliases,
+                        "fixed_versions": fixed_versions, "references": references,
+                        "severity_basis": database_severity or "OSV advisory; manual severity review required",
+                    },
                 )
 
 
-def run_security_scan(job_id, requested_by, requested_by_email):
+def run_security_scan(job_id, requested_by, requested_by_email, github_token=None):
     started = time.monotonic()
     findings = []
     try:
         security_scan_update(job_id, status="running", stage="Fetching protected source snapshots", progress=8)
-        sources, source_errors = security_scan_sources()
+        sources, source_errors = security_scan_sources(github_token)
         file_count = sum(len(source["files"]) for source in sources)
         security_scan_update(job_id, stage="Building code and dependency inventory", progress=24, files_scanned=file_count, repositories=[source["repository"] for source in sources])
         packages = scan_dependency_inventory(sources)
@@ -3785,6 +3814,10 @@ def security_scans():
             memory_latest = next((dict(job) for job in reversed(list(_security_scan_jobs.values())) if job.get("status") == "complete"), None)
         latest = memory_latest or app_setting_value("latest_vulnerability_scan", None)
         return jsonify({"active": active, "latest": latest, "access": "ceo_or_developer"})
+    payload = request.get_json(silent=True) or {}
+    github_token = str(payload.get("github_token") or "").strip()
+    if github_token and (len(github_token) > 300 or not github_token.startswith(("github_pat_", "ghp_"))):
+        return api_error(422, "invalid_github_token", "Use a GitHub personal access token with read-only repository contents access.")
     with _security_scan_lock:
         active = next((job for job in _security_scan_jobs.values() if job.get("status") in {"queued", "running"}), None)
         if active:
@@ -3796,7 +3829,7 @@ def security_scans():
             "files_scanned": 0, "dependencies_scanned": 0, "repositories": [], "findings": [],
         }
         _security_scan_jobs[job_id] = job
-    SECURITY_SCAN_POOL.submit(run_security_scan, job_id, g.user_id, user_email(g.user))
+    SECURITY_SCAN_POOL.submit(run_security_scan, job_id, g.user_id, user_email(g.user), github_token or None)
     return jsonify(job), 202
 
 
